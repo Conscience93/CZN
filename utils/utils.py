@@ -43,9 +43,26 @@ def load_text(name: str) -> dict[str, str]:
 
 
 @cache
+def _resolve_db_path(name: str) -> Path:
+    path = db_root / f"{name}.json"
+    if path.exists():
+        return path
+
+    match = re.fullmatch(r"(?P<prefix>.*\D)(?P<version>\d+)(?P<suffix>@.*)?", name)
+    if match is None:
+        return path
+
+    suffix = match.group("suffix") or ""
+    candidates = sorted(
+        db_root.glob(f"{match.group('prefix')}[0-9]*{suffix}.json")
+    )
+    return candidates[-1] if candidates else path
+
+
+@cache
 def load_db(name: str) -> list[dict]:
     text = load_text_full()
-    raw = json.loads((db_root / f"{name}.json").read_text(encoding="utf-8"))
+    raw = json.loads(_resolve_db_path(name).read_text(encoding="utf-8"))
     result = []
     for entry in raw:
         resolved = {}

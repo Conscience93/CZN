@@ -52,6 +52,14 @@ def maybe_int(value):
         return value
 
 
+def normalize_rarity(value: str) -> str:
+    return value.removeprefix("RARITY_")
+
+
+def rarity_sort_value(value: str) -> int:
+    return {"SSR": 0, "SR": 1, "R": 2}.get(value, 99)
+
+
 def clean_skill_text(text: str) -> str:
     text = re.sub(r"\$([^$]*?)(?:#\d+)?\$", r"\1", text)
     text = re.sub(r"</>", "", text)
@@ -154,6 +162,49 @@ def load_partner_base_map() -> dict[int, dict]:
             continue
         result[partner_id] = entry
     return result
+
+
+@cache
+def load_partner_char_base_map() -> dict[int, dict]:
+    result = {}
+    for entry in load_db("partner_base@char_base"):
+        try:
+            partner_id = int(entry["id"])
+        except KeyError:
+            continue
+        except TypeError:
+            continue
+        except ValueError:
+            continue
+        result[partner_id] = entry
+    return result
+
+
+@cache
+def load_base_class_name_map() -> dict[str, str]:
+    return {
+        entry["id"]: entry.get("class_name", "")
+        for entry in load_db("base_class_define@base_class_define")
+        if entry.get("id")
+    }
+
+
+@cache
+def load_faction_name_map() -> dict[str, str]:
+    return {
+        entry["id"]: entry.get("name", "")
+        for entry in load_db("faction@faction")
+        if entry.get("id")
+    }
+
+
+@cache
+def load_sub_faction_name_map() -> dict[str, str]:
+    return {
+        entry["id"]: entry.get("name", "")
+        for entry in load_db("faction@sub_faction")
+        if entry.get("id")
+    }
 
 
 @cache
@@ -356,8 +407,32 @@ def parse_partner_info() -> dict[int, dict]:
         result[char_id] = {"id": char_id, "name": partners[char_id].name} | {
             k: resolve_text_markup(entry[k]) for k in INFO_FIELDS if k in entry
         }
+        if "specialty" in result[char_id]:
+            result[char_id]["gift"] = result[char_id]["specialty"]
+        char_base_entry = load_partner_char_base_map().get(char_id)
+        if char_base_entry:
+            rarity = normalize_rarity(char_base_entry.get("rarity", ""))
+            if rarity:
+                result[char_id]["rarity"] = rarity
+            faction_id = char_base_entry.get("link_faction_id", "")
+            sub_faction_id = char_base_entry.get("link_sub_faction_id", "")
+            faction = load_faction_name_map().get(faction_id, faction_id)
+            sub_faction = load_sub_faction_name_map().get(sub_faction_id, "")
+            if faction:
+                result[char_id]["faction"] = faction
+            if sub_faction:
+                result[char_id]["sub_faction"] = sub_faction
+                result[char_id]["affiliation"] = sub_faction
+                if faction:
+                    result[char_id]["affiliation_full"] = f"{sub_faction} of {faction}"
+            elif faction:
+                result[char_id]["affiliation"] = faction
         base_entry = load_partner_base_map().get(char_id)
         if base_entry:
+            class_id = base_entry.get("passive_condition_link_base_class_define_id", "")
+            class_name = load_base_class_name_map().get(class_id, "")
+            if class_name:
+                result[char_id]["class"] = class_name
             ego_skill = parse_partner_ego_skill(base_entry)
             if ego_skill:
                 result[char_id]["ego_skill"] = ego_skill
@@ -375,12 +450,43 @@ def partner_pages(page_suffix: str = "") -> list[Page]:
     return list(PreloadingGenerator(pages))
 
 
+def partner_list_info() -> list[dict]:
+    result = []
+    for info in sorted(
+        parse_partner_info().values(),
+        key=lambda partner: (rarity_sort_value(partner.get("rarity", "")), partner["id"]),
+    ):
+        ego_skill = info.get("ego_skill") or {}
+        result.append(
+            {
+                "id": info["id"],
+                "name": info["name"],
+                "rarity": info.get("rarity", ""),
+                "class": info.get("class", ""),
+                "race_type": info.get("race_type", ""),
+                "specialty": info.get("specialty", ""),
+                "gift": info.get("gift", ""),
+                "affiliation": info.get("affiliation", ""),
+                "faction": info.get("faction", ""),
+                "sub_faction": info.get("sub_faction", ""),
+                "ego_skill_name": ego_skill.get("name", ""),
+            }
+        )
+    return result
+
+
 def save_partner_info():
     from utils.wiki_utils import save_json_page
 
     info_data = parse_partner_info()
     obj = {info["name"]: info for info in info_data.values()}
     save_json_page("Module:PartnerInfo/data.json", obj, summary="update partner info")
+
+    save_json_page(
+        "Module:PartnerInfo/data2.json",
+        partner_list_info(),
+        summary="update partner list info",
+    )
 
 
 def main():
