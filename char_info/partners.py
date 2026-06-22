@@ -1,7 +1,7 @@
 import json
 import re
-from dataclasses import dataclass
 from collections import defaultdict
+from dataclasses import dataclass, field
 from functools import cache
 
 from pywikibot import Page
@@ -12,9 +12,46 @@ from utils.utils import assets_root, db_root, load_db, resolve_text_markup
 
 
 @dataclass
+class PartnerEgoSkill:
+    id: str
+    name: str
+    cost: int | str = ""
+    category: str = ""
+    desc: str = ""
+
+
+@dataclass
+class PartnerPassiveSkill:
+    id: str
+    class_: int | str = field(default="")
+    level: int | str = ""
+    name: str = ""
+    desc: str = ""
+
+
+@dataclass
 class Partner:
     id: int
     name: str
+    background_text: str = ""
+    specialty: str = ""
+    gift: str = ""
+    birth_day: str = ""
+    birth_month: str = ""
+    race_type: str = ""
+    passive: str = ""
+    ego_skill: PartnerEgoSkill | None = None
+    cv_en: str = ""
+    cv_ja: str = ""
+    cv_ko: str = ""
+    cv_zhs: str = ""
+    rarity: str = ""
+    class_: str = field(default="")
+    faction: str = ""
+    sub_faction: str = ""
+    affiliation: str = ""
+    affiliation_full: str = ""
+    passive_skills: list[PartnerPassiveSkill] = field(default_factory=list)
 
 
 INFO_FIELDS = {
@@ -23,9 +60,7 @@ INFO_FIELDS = {
     "birth_day",
     "birth_month",
     "race_type",
-    "specialty",
     "passive",
-    "ego_skill",
     "cv_en",
     "cv_ja",
     "cv_ko",
@@ -306,7 +341,7 @@ def load_partner_passive_skill_eff_map() -> dict[str, dict]:
     return result
 
 
-def parse_partner_ego_skill(base_entry: dict) -> dict | None:
+def parse_partner_ego_skill(base_entry: dict) -> PartnerEgoSkill | None:
     card_id = base_entry.get("link_card_id", "")
     card = load_partner_card_map().get(card_id)
     if not card:
@@ -317,13 +352,13 @@ def parse_partner_ego_skill(base_entry: dict) -> dict | None:
         resolve_partner_ego_placeholders(ego_desc_text(card), skill_eff_ids)
     )
 
-    return {
-        "id": card["id"],
-        "name": clean_skill_text(card.get("name", "")),
-        "cost": maybe_int(card.get("cost", "")),
-        "category": card.get("raw_card_category", card.get("card_category", "")),
-        "desc": desc,
-    }
+    return PartnerEgoSkill(
+        id=card["id"],
+        name=clean_skill_text(card.get("name", "")),
+        cost=maybe_int(card.get("cost", "")),
+        category=card.get("raw_card_category", card.get("card_category", "")),
+        desc=desc,
+    )
 
 
 def _passive_skill_eff_ids(passive_entry: dict) -> list[str]:
@@ -342,7 +377,7 @@ def _passive_sort_value(value):
     return (1, str(value))
 
 
-def parse_partner_passive_skills(base_entry: dict) -> list[dict]:
+def parse_partner_passive_skills(base_entry: dict) -> list[PartnerPassiveSkill]:
     group = base_entry.get("link_partner_passive_group", "")
     passives = []
     for entry in load_partner_passive_groups().get(group, []):
@@ -354,21 +389,21 @@ def parse_partner_passive_skills(base_entry: dict) -> list[dict]:
             )
         )
         passives.append(
-            {
-                "id": entry["id"],
-                "class": maybe_int(entry.get("class", "")),
-                "level": maybe_int(entry.get("level", "")),
-                "name": clean_skill_text(entry.get("name", "")),
-                "desc": desc,
-            }
+            PartnerPassiveSkill(
+                id=entry["id"],
+                class_=maybe_int(entry.get("class", "")),
+                level=maybe_int(entry.get("level", "")),
+                name=clean_skill_text(entry.get("name", "")),
+                desc=desc,
+            )
         )
 
     return sorted(
         passives,
         key=lambda passive: (
-            _passive_sort_value(passive["class"]),
-            _passive_sort_value(passive["level"]),
-            passive["id"],
+            _passive_sort_value(passive.class_),
+            _passive_sort_value(passive.level),
+            passive.id,
         ),
     )
 
@@ -382,94 +417,136 @@ def parse_partners() -> dict[int, Partner]:
             partner_id = int(id_str)
             result[partner_id] = Partner(id=partner_id, name=name)
 
-    # partner_text = load_text("char_base")
-    # for key, name in partner_text.items():
-    #     prefix, _, id_str = key.partition("@")
-    #     if prefix == "name":
-    #         if id_str.isnumeric():
-    #             partner_id = int(id_str).removesuffix("_info")
-    #             desc = partner_text.get(f'background_text@{id_str}').removesuffix("_info")
-    #             result[name] = Partner(id=partner_id, name=name, desc=desc)
-
-    return result
-
-
-@cache
-def parse_partner_info() -> dict[int, dict]:
-    partners = parse_partners()
     released_partner_ids = load_released_partner_ids()
-    db_data = load_db("supporter_info@supporter_info")
-    result = {}
-    for entry in db_data:
+    partners = {}
+    for entry in load_db("supporter_info@supporter_info"):
         char_id = int(entry["id"].removesuffix("_info"))
-        if char_id not in partners or char_id not in released_partner_ids:
+        if char_id not in result or char_id not in released_partner_ids:
             continue
-        result[char_id] = {"id": char_id, "name": partners[char_id].name} | {
-            k: resolve_text_markup(entry[k]) for k in INFO_FIELDS if k in entry
-        }
-        if "specialty" in result[char_id]:
-            result[char_id]["gift"] = result[char_id]["specialty"]
+        partner = result[char_id]
+        for key in INFO_FIELDS:
+            if key in entry:
+                setattr(partner, key, resolve_text_markup(entry[key]))
+        if partner.specialty:
+            partner.gift = partner.specialty
         char_base_entry = load_partner_char_base_map().get(char_id)
         if char_base_entry:
             rarity = normalize_rarity(char_base_entry.get("rarity", ""))
             if rarity:
-                result[char_id]["rarity"] = rarity
+                partner.rarity = rarity
             faction_id = char_base_entry.get("link_faction_id", "")
             sub_faction_id = char_base_entry.get("link_sub_faction_id", "")
             faction = load_faction_name_map().get(faction_id, faction_id)
             sub_faction = load_sub_faction_name_map().get(sub_faction_id, "")
             if faction:
-                result[char_id]["faction"] = faction
+                partner.faction = faction
             if sub_faction:
-                result[char_id]["sub_faction"] = sub_faction
-                result[char_id]["affiliation"] = sub_faction
+                partner.sub_faction = sub_faction
+                partner.affiliation = sub_faction
                 if faction:
-                    result[char_id]["affiliation_full"] = f"{sub_faction} of {faction}"
+                    partner.affiliation_full = f"{sub_faction} of {faction}"
             elif faction:
-                result[char_id]["affiliation"] = faction
+                partner.affiliation = faction
         base_entry = load_partner_base_map().get(char_id)
         if base_entry:
             class_id = base_entry.get("passive_condition_link_base_class_define_id", "")
             class_name = load_base_class_name_map().get(class_id, "")
             if class_name:
-                result[char_id]["class"] = class_name
+                partner.class_ = class_name
             ego_skill = parse_partner_ego_skill(base_entry)
             if ego_skill:
-                result[char_id]["ego_skill"] = ego_skill
-            result[char_id]["passive_skills"] = parse_partner_passive_skills(base_entry)
-    return result
+                partner.ego_skill = ego_skill
+            partner.passive_skills = parse_partner_passive_skills(base_entry)
+        partners[char_id] = partner
+    return partners
+
+
+def partner_ego_skill_info(skill: PartnerEgoSkill) -> dict:
+    return {
+        "id": skill.id,
+        "name": skill.name,
+        "cost": skill.cost,
+        "category": skill.category,
+        "desc": skill.desc,
+    }
+
+
+def partner_passive_skill_info(skill: PartnerPassiveSkill) -> dict:
+    return {
+        "id": skill.id,
+        "class": skill.class_,
+        "level": skill.level,
+        "name": skill.name,
+        "desc": skill.desc,
+    }
+
+
+def partner_info(partner: Partner) -> dict:
+    info: dict[str, int | str | dict | list] = {
+        "id": partner.id,
+        "name": partner.name,
+    }
+    for key in (
+        "background_text",
+        "specialty",
+        "gift",
+        "birth_day",
+        "birth_month",
+        "race_type",
+        "passive",
+        "cv_en",
+        "cv_ja",
+        "cv_ko",
+        "cv_zhs",
+        "rarity",
+        "faction",
+        "sub_faction",
+        "affiliation",
+        "affiliation_full",
+    ):
+        value = getattr(partner, key)
+        if value:
+            info[key] = value
+    if partner.class_:
+        info["class"] = partner.class_
+    if partner.ego_skill:
+        info["ego_skill"] = partner_ego_skill_info(partner.ego_skill)
+    if partner.passive_skills:
+        info["passive_skills"] = [
+            partner_passive_skill_info(skill) for skill in partner.passive_skills
+        ]
+    return info
 
 
 def partner_pages(page_suffix: str = "") -> list[Page]:
     from utils.wiki_utils import s
 
     pages = [
-        Page(s, f'{info["name"]}{page_suffix}')
-        for info in parse_partner_info().values()
+        Page(s, f"{partner.name}{page_suffix}")
+        for partner in parse_partners().values()
     ]
     return list(PreloadingGenerator(pages))
 
 
 def partner_list_info() -> list[dict]:
     result = []
-    for info in sorted(
-        parse_partner_info().values(),
-        key=lambda partner: (rarity_sort_value(partner.get("rarity", "")), partner["id"]),
+    for partner in sorted(
+        parse_partners().values(),
+        key=lambda partner: (rarity_sort_value(partner.rarity), partner.id),
     ):
-        ego_skill = info.get("ego_skill") or {}
         result.append(
             {
-                "id": info["id"],
-                "name": info["name"],
-                "rarity": info.get("rarity", ""),
-                "class": info.get("class", ""),
-                "race_type": info.get("race_type", ""),
-                "specialty": info.get("specialty", ""),
-                "gift": info.get("gift", ""),
-                "affiliation": info.get("affiliation", ""),
-                "faction": info.get("faction", ""),
-                "sub_faction": info.get("sub_faction", ""),
-                "ego_skill_name": ego_skill.get("name", ""),
+                "id": partner.id,
+                "name": partner.name,
+                "rarity": partner.rarity,
+                "class": partner.class_,
+                "race_type": partner.race_type,
+                "specialty": partner.specialty,
+                "gift": partner.gift,
+                "affiliation": partner.affiliation,
+                "faction": partner.faction,
+                "sub_faction": partner.sub_faction,
+                "ego_skill_name": partner.ego_skill.name if partner.ego_skill else "",
             }
         )
     return result
@@ -478,8 +555,10 @@ def partner_list_info() -> list[dict]:
 def save_partner_info():
     from utils.wiki_utils import save_json_page
 
-    info_data = parse_partner_info()
-    obj = {info["name"]: info for info in info_data.values()}
+    obj = {
+        partner.name: partner_info(partner)
+        for partner in parse_partners().values()
+    }
     save_json_page("Module:PartnerInfo/data.json", obj, summary="update partner info")
 
     save_json_page(

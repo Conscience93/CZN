@@ -367,11 +367,11 @@ def combatant_names() -> dict[int, str]:
 
 @cache
 def partner_names() -> dict[int, str]:
-    from char_info.partners import parse_partner_info
+    from char_info.partners import parse_partners
 
     return {
-        partner_id: str(info["name"])
-        for partner_id, info in parse_partner_info().items()
+        partner_id: partner.name
+        for partner_id, partner in parse_partners().items()
     }
 
 

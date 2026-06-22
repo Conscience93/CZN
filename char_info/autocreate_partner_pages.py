@@ -1,6 +1,6 @@
 from string import Template
 
-from char_info.partners import parse_partner_info, partner_pages
+from char_info.partners import parse_partners, partner_pages
 from utils.wiki_utils import save_wikitext_page
 
 
@@ -27,12 +27,12 @@ def auto_create_partner_pages():
 {{Partner Navbox}}""")
 
     pages = {p.title(with_ns=False): p for p in partner_pages()}
-    for info in sorted(parse_partner_info().values(), key=lambda partner: partner["id"]):
-        p = pages[info["name"]]
+    for partner in sorted(parse_partners().values(), key=lambda partner: partner.id):
+        p = pages[partner.name]
         if p.exists():
             continue
 
-        text = template.safe_substitute(name=info["name"])
+        text = template.safe_substitute(name=partner.name)
         save_wikitext_page(p, text, summary="auto-create partner page")
 
 
