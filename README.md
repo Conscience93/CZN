@@ -6,3 +6,8 @@ Make sure `uv` is installed. Run
 ```shell
 uv run main.py
 ```
+
+For subdirectories such as `scripts`, run
+```shell
+uv run -m scripts.upload_icons
+```
