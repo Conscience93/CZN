@@ -20,7 +20,6 @@ import re
 import shutil
 import socket
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -101,6 +100,17 @@ class ExportResultHandler(http.server.SimpleHTTPRequestHandler):
         if self.server.verbose:
             super().log_message(_format, *_args)
 
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/__spine_export__/next":
+            try:
+                job = self.server.jobs.get_nowait()
+            except queue.Empty:
+                job = {"done": True}
+            self._send_json(job)
+            return
+        super().do_GET()
+
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
@@ -120,7 +130,7 @@ class ExportResultHandler(http.server.SimpleHTTPRequestHandler):
             if frame_index < 0:
                 self.send_error(400, "invalid frame index")
                 return
-            target = frame_dir / f"frame_{frame_index:06d}.png"
+            target = frame_dir / f"frame_{frame_index:06d}.rgba"
             with target.open("wb") as f:
                 remaining = length
                 while remaining:
@@ -142,23 +152,6 @@ class ExportResultHandler(http.server.SimpleHTTPRequestHandler):
             payload["ok"] = True
             payload["frames_complete"] = True
             self.server.results.put(payload)
-            self._send_json({"ok": True})
-            return
-
-        if parsed.path == "/__spine_export__/capture":
-            target = self.server.capture_paths.get(job_id)
-            if target is None:
-                self.send_error(404, "unknown export job")
-                return
-            with target.open("wb") as f:
-                remaining = length
-                while remaining:
-                    chunk = self.rfile.read(min(1024 * 1024, remaining))
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    remaining -= len(chunk)
-            self.server.results.put({"id": job_id, "ok": True, "capture": str(target)})
             self._send_json({"ok": True})
             return
 
@@ -187,12 +180,16 @@ class ExportResultHandler(http.server.SimpleHTTPRequestHandler):
 
 class ExportServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
+    # Frames upload several at a time over short-lived HTTP/1.0 connections; the
+    # default backlog of 5 overflows under that burst and the browser sees a
+    # refused connection ("Failed to fetch").
+    request_queue_size = 128
 
     def __init__(self, address: tuple[str, int], handler: type[ExportResultHandler], directory: Path, verbose: bool) -> None:
         super().__init__(address, lambda *args, **kwargs: handler(*args, directory=str(directory), **kwargs))
-        self.capture_paths: dict[str, Path] = {}
         self.frame_dirs: dict[str, Path] = {}
         self.results: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.jobs: queue.Queue[dict[str, Any]] = queue.Queue()
         self.verbose = verbose
 
 def parse_args() -> argparse.Namespace:
@@ -200,35 +197,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--character", action="append", help="Playable character ID or slug/name. May be passed more than once.")
     parser.add_argument("--type", default="all", help="Comma-separated export groups: all, battle_ready, model, card.")
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--output-scale", type=float, default=4.0, help="Scale intrinsic skeleton bounds to output dimensions.")
-    parser.add_argument("--battle-resolution-scale", type=float, default=2.0 / 3.0, help="Additional output-size multiplier for battle_ready exports only.")
-    parser.add_argument("--card-output-scale", type=float, default=12.0, help="Scale card skeleton bounds before cropping black borders.")
-    parser.add_argument("--render-scale", choices=("1", "2", "3", "4"), default="2", help="Browser backing-canvas scale before ffmpeg downsampling.")
-    parser.add_argument("--max-capture-edge", type=int, default=0, help="Optional maximum browser backing-canvas edge. Large exports automatically lower render scale to fit.")
-    parser.add_argument("--max-capture-pixels", type=int, default=24_000_000, help="Maximum browser backing-canvas pixels before automatically lowering render scale.")
-    parser.add_argument("--large-capture-pixels", type=int, default=20_000_000, help="Browser backing-canvas pixels before applying large-capture FPS throttling.")
-    parser.add_argument("--large-capture-fps", type=int, default=12, help="FPS to use when a large deterministic capture is automatically downscaled.")
-    parser.add_argument("--min-large-capture-fps", type=int, default=6, help="Lowest FPS allowed for automatic large deterministic capture throttling.")
-    parser.add_argument("--max-deterministic-megapixel-frames", type=float, default=1200.0, help="Maximum megapixel-frames for automatically downscaled deterministic captures.")
+    parser.add_argument("--output-scale", type=float, default=2.0, help="Scale intrinsic skeleton bounds to output dimensions.")
+    parser.add_argument("--render-scale", choices=("1", "2", "3", "4"), default="1", help="Browser backing-canvas supersampling before ffmpeg downsampling. 1 disables supersampling (fastest).")
     parser.add_argument("--vp9-crf", type=int, default=18, help="VP9 CRF for deterministic and crop transcodes. Lower is higher quality.")
     parser.add_argument("--vp9-cpu-used", type=int, default=4, help="libvpx-vp9 speed setting. Higher is faster, usually larger/slightly lower quality.")
     parser.add_argument("--vp9-deadline", choices=("best", "good", "realtime"), default="good", help="libvpx-vp9 encoding deadline.")
     parser.add_argument("--ffmpeg-threads", type=int, default=0, help="ffmpeg encoder thread count. 0 lets ffmpeg choose.")
     parser.add_argument("--padding", type=float, default=24.0, help="Padding in skeleton coordinate units before output scaling.")
     parser.add_argument("--battle-crop-padding", type=int, default=16, help="Pixel padding to keep around detected battle_ready content after cropping.")
-    parser.add_argument("--card-crop-padding", type=int, default=24, help="Pixel padding to keep around detected card content after cropping.")
+    parser.add_argument("--card-crop-padding", type=int, default=0, help="Pixel padding to keep around detected card content after cropping. Cards are transparent, so 0 keeps the art flush with no border.")
     parser.add_argument("--battle-transparent", action="store_true", help="Keep battle_ready exports transparent. By default they use the preview's dark background to avoid additive-effect alpha artifacts.")
     parser.add_argument("--opaque-crop-threshold", type=int, default=8, help="RGB distance from the preview background required for opaque crop detection.")
     parser.add_argument("--no-battle-crop", action="store_true", help="Disable post-capture black border cropping for battle_ready exports.")
     parser.add_argument("--no-card-crop", action="store_true", help="Disable post-capture black border cropping for card exports.")
+    parser.add_argument("--no-card-trim", action="store_true", help="Keep the zoom-in lead-in frames of card animations instead of starting playback at the settled card.")
     parser.add_argument("--max-edge", type=int, default=0, help="Optional maximum output width/height.")
     parser.add_argument("--card-max-edge", type=int, default=4096, help="Optional maximum card capture width/height before cropping.")
-    parser.add_argument("--min-duration", type=float, default=1.0)
     parser.add_argument("--duration-pad", type=float, default=0.25)
     parser.add_argument("--capture-timeout", type=float, default=360.0)
-    parser.add_argument("--capture-mode", choices=("auto", "realtime", "deterministic"), default="deterministic", help="Use fast MediaRecorder capture, fixed frame capture, or auto mode.")
-    parser.add_argument("--deterministic-fallback", action="store_true", help="In auto mode, retry with fixed PNG frames if realtime capture duration drifts.")
-    parser.add_argument("--duration-tolerance", type=float, default=0.35, help="Allowed WebM duration drift in seconds before auto mode falls back to deterministic capture.")
     parser.add_argument("--force-swiftshader", action="store_true", help="Force Chrome's software WebGL renderer. Off by default so hardware GPU can be used.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--keep-temp", action="store_true")
@@ -249,15 +235,7 @@ def main() -> int:
             "groups": sorted(groups),
             "fps": args.fps,
             "output_scale": args.output_scale,
-            "battle_resolution_scale": args.battle_resolution_scale,
-            "card_output_scale": args.card_output_scale,
             "render_scale": render_scale(args),
-            "max_capture_edge": args.max_capture_edge,
-            "max_capture_pixels": args.max_capture_pixels,
-            "large_capture_pixels": args.large_capture_pixels,
-            "large_capture_fps": args.large_capture_fps,
-            "min_large_capture_fps": args.min_large_capture_fps,
-            "max_deterministic_megapixel_frames": args.max_deterministic_megapixel_frames,
             "vp9_crf": args.vp9_crf,
             "vp9_cpu_used": args.vp9_cpu_used,
             "vp9_deadline": args.vp9_deadline,
@@ -269,13 +247,10 @@ def main() -> int:
             "battle_crop_padding": args.battle_crop_padding,
             "card_crop": not args.no_card_crop,
             "card_crop_padding": args.card_crop_padding,
+            "card_trim": not args.no_card_trim,
             "max_edge": args.max_edge,
             "card_max_edge": args.card_max_edge,
-            "min_duration": args.min_duration,
             "duration_pad": args.duration_pad,
-            "capture_mode": args.capture_mode,
-            "deterministic_fallback": args.deterministic_fallback,
-            "duration_tolerance": args.duration_tolerance,
             "force_swiftshader": args.force_swiftshader,
             "overwrite": args.overwrite,
         },
@@ -298,15 +273,7 @@ def main() -> int:
         tmp_dir = Path(tmp)
         with run_export_server(args.verbose) as server:
             base_url = f"http://127.0.0.1:{server.server_port}"
-            for index, job in enumerate(jobs, start=1):
-                print(f"[{index}/{len(jobs)}] {job.key}", flush=True)
-                result = export_job(job, args, server, base_url, tmp_dir)
-                if result.get("ok"):
-                    manifest["jobs"].append(result)
-                elif result.get("skipped"):
-                    manifest["skipped"].append(result)
-                else:
-                    manifest["errors"].append(result)
+            run_jobs(jobs, args, server, base_url, tmp_dir, manifest)
 
         if args.keep_temp:
             kept = L2D_ROOT / f"export_temp_{int(time.time())}"
@@ -400,11 +367,12 @@ def build_jobs(characters: list[Character], groups: set[str], args: argparse.Nam
                     args,
                 )
         if "card" in groups:
-            for number in range(1, 6):
-                source_json = CARD_DIR / f"unique_{char.id}_{number:02d}.json"
+            card_jsons = sorted(CARD_DIR.glob(f"unique_{char.id}_*.json"))
+            for source_json in card_jsons:
+                number = int(source_json.stem.rsplit("_", 1)[1])
                 source_atlas = source_json.with_suffix(".atlas")
-                if not source_json.exists() or not source_atlas.exists():
-                    skipped.append(skip_payload(char, "card", source_json, "missing source json or atlas"))
+                if not source_atlas.exists():
+                    skipped.append(skip_payload(char, "card", source_json, "missing source atlas"))
                     continue
                 data = load_json(source_json)
                 animations = list(data.get("animations", {}))
@@ -452,7 +420,7 @@ def add_job(
     capture_width = final_width
     capture_height = final_height
     duration = sum(animation_duration(data["animations"][animation]) for animation in animations)
-    duration = max(args.min_duration, duration + args.duration_pad)
+    duration = duration + args.duration_pad
     jobs.append(
         ExportJob(
             group=group,
@@ -496,10 +464,6 @@ def compute_dimensions(width: float, height: float, output_scale: float, padding
 
 
 def group_output_scale(group: str, args: argparse.Namespace) -> float:
-    if group == "card":
-        return args.card_output_scale
-    if group == "battle_ready":
-        return args.output_scale * args.battle_resolution_scale
     return args.output_scale
 
 
@@ -535,9 +499,8 @@ def iter_times(value: Any) -> list[float]:
 def print_dry_run(jobs: list[ExportJob], skipped: list[dict[str, Any]], args: argparse.Namespace) -> None:
     print(f"Planned jobs: {len(jobs)}")
     print("Format: webm")
+    scale = render_scale(args)
     for job in jobs:
-        scale = effective_render_scale(job, args)
-        capture_fps = effective_capture_fps(job, args, scale)
         capture_width, capture_height = actual_capture_dimensions(job, scale)
         print(
             f"{job.key}: {rel(job.source_json)} "
@@ -545,8 +508,7 @@ def print_dry_run(jobs: list[ExportJob], skipped: list[dict[str, Any]], args: ar
             f"{job.final_width}x{job.final_height} "
             f"capture {capture_width}x{capture_height} "
             f"scale {scale}x "
-            f"capture fps {capture_fps} "
-            f"output fps {args.fps}"
+            f"fps {args.fps}"
         )
     if skipped:
         print(f"\nSkipped before export: {len(skipped)}")
@@ -589,47 +551,120 @@ def ignore_export_temp(_directory: str, names: list[str]) -> set[str]:
     return {name for name in names if name.startswith("chrome-")}
 
 
-def export_job(
-    job: ExportJob,
+def run_jobs(
+    jobs: list[ExportJob],
     args: argparse.Namespace,
     server: ExportServer,
     base_url: str,
     tmp_dir: Path,
-) -> dict[str, Any]:
-    target = job.output_dir / f"{job.output_stem}.webm"
-    if target.exists() and not args.overwrite:
-        return {
-            "skipped": True,
-            "key": job.key,
-            "reason": "target already exists",
-            "existing": [rel(target)],
-        }
+    manifest: dict[str, Any],
+) -> None:
+    """Render every job in a single long-lived Chrome that pulls work from a queue.
 
-    job.output_dir.mkdir(parents=True, exist_ok=True)
-    job_id = f"{int(time.time() * 1000)}-{os.getpid()}-{safe_stem(job.key)}"
+    Chrome cold-starts a process, initialises the GPU, and re-fetches the Spine
+    runtime from the CDN on every launch, so launching it once per job dominated
+    the export wall time. Here Chrome loads the controller page once and pulls each
+    job from /__spine_export__/next, keeping the runtime and GL context warm; Python
+    encodes each job's frames as the browser moves on to the next, overlapping the
+    two stages.
+    """
+    plans: list[tuple[ExportJob, str, Path, Path]] = []
+    for index, job in enumerate(jobs, start=1):
+        target = job.output_dir / f"{job.output_stem}.webm"
+        if target.exists() and not args.overwrite:
+            manifest["skipped"].append({
+                "skipped": True,
+                "key": job.key,
+                "reason": "target already exists",
+                "existing": [rel(target)],
+            })
+            continue
+        job.output_dir.mkdir(parents=True, exist_ok=True)
+        capture_id = f"{int(time.time() * 1000)}-{os.getpid()}-{index}-{safe_stem(job.key)}"
+        frame_dir = tmp_dir / f"{capture_id}-frames"
+        frame_dir.mkdir(parents=True)
+        server.frame_dirs[capture_id] = frame_dir
+        server.jobs.put(job_descriptor(capture_id, job, args))
+        plans.append((job, capture_id, frame_dir, target))
+
+    if not plans:
+        return
+
+    scale = render_scale(args)
+    url = build_controller_url(base_url, runtime_urls(args))
+    chrome = launch_chrome(args, url, tmp_dir / "chrome-controller")
     try:
-        capture_path, capture_meta = capture_job_video(job_id, job, args, server, base_url, tmp_dir)
+        total = len(plans)
+        for index, (job, capture_id, frame_dir, target) in enumerate(plans, start=1):
+            print(f"[{index}/{total}] {job.key}", flush=True)
+            result = finalize_capture(job, capture_id, frame_dir, target, args, server, scale, chrome)
+            if result.get("ok"):
+                manifest["jobs"].append(result)
+            else:
+                manifest["errors"].append(result)
+            # Raw RGBA frames are large; drop each job's frames once encoded so peak
+            # disk stays near one job's worth instead of the whole run's.
+            if not args.keep_temp:
+                shutil.rmtree(frame_dir, ignore_errors=True)
+    finally:
+        terminate_process(chrome)
+        for _, capture_id, _, _ in plans:
+            server.frame_dirs.pop(capture_id, None)
 
-        crop = capture_meta.get("crop")
-        source_for_final = capture_path
-        scale = int(capture_meta.get("render_scale") or effective_render_scale(job, args))
-        if capture_meta["mode"] != "deterministic":
-            target_width = job.final_width
-            target_height = job.final_height
-            needs_transcode = scale != 1
-            if should_crop_job(job, args):
-                crop = detect_video_crop(capture_path, scaled_crop_padding(job, args, scale), job_uses_alpha(job, args))
-                needs_transcode = needs_transcode or crop is not None
-                if crop is not None:
-                    target_width, target_height = scaled_crop_dimensions(crop, scale)
-            if needs_transcode:
-                normalized_path = tmp_dir / f"{job_id}.normalized.webm"
-                transcode_video(capture_path, normalized_path, args, target_width, target_height, crop, job_uses_alpha(job, args))
-                source_for_final = normalized_path
 
-        output_width, output_height = video_dimensions(source_for_final)
+def finalize_capture(
+    job: ExportJob,
+    capture_id: str,
+    frame_dir: Path,
+    target: Path,
+    args: argparse.Namespace,
+    server: ExportServer,
+    scale: int,
+    chrome: subprocess.Popen[bytes],
+) -> dict[str, Any]:
+    fps = args.fps
+    alpha = job_uses_alpha(job, args)
+    try:
+        capture_result = wait_for_capture(server, capture_id, args.capture_timeout, chrome)
+        if not capture_result.get("ok"):
+            raise RuntimeError(capture_result.get("message", "browser capture failed"))
+        frame_count = int(capture_result.get("frames") or 0)
+        if frame_count <= 0:
+            raise RuntimeError("browser did not report exported frames")
+        missing = missing_frames(frame_dir, frame_count)
+        if missing:
+            raise RuntimeError(f"browser export missed frame(s): {format_missing_frames(missing)}")
+        frame_width = int(capture_result.get("width") or 0)
+        frame_height = int(capture_result.get("height") or 0)
+        if frame_width <= 0 or frame_height <= 0:
+            raise RuntimeError("browser did not report frame dimensions")
 
-        shutil.copyfile(source_for_final, target)
+        crop = None
+        target_width = job.final_width
+        target_height = job.final_height
+        if should_crop_job(job, args):
+            crop = detect_frame_crop(
+                frame_dir,
+                frame_count,
+                frame_width,
+                frame_height,
+                scaled_crop_padding(job, args, scale),
+                alpha,
+                args.opaque_crop_threshold,
+            )
+            if crop is not None:
+                target_width, target_height = scaled_crop_dimensions(crop, scale)
+
+        start_frame = 0
+        if job.group == "card" and not args.no_card_trim:
+            start_frame = detect_card_lead_in(frame_dir, frame_count, frame_width, frame_height)
+
+        capture_path = frame_dir.parent / f"{capture_id}.webm"
+        encode_frames(frame_dir, capture_path, args, frame_width, frame_height, target_width, target_height, frame_count, crop, fps, fps, alpha, start_frame)
+        output_width, output_height = video_dimensions(capture_path)
+        actual_duration = video_duration(capture_path)
+
+        shutil.copyfile(capture_path, target)
         return {
             "ok": True,
             "key": job.key,
@@ -642,160 +677,22 @@ def export_job(
             "intrinsic_dimensions": [job.intrinsic_width, job.intrinsic_height],
             "dimensions": [output_width, output_height],
             "planned_dimensions": [job.final_width, job.final_height],
-            "capture_dimensions": capture_meta["capture_dimensions"],
+            "capture_dimensions": list(actual_capture_dimensions(job, scale)),
             "requested_render_scale": render_scale(args),
             "render_scale": scale,
-            "fps": capture_meta.get("output_fps", args.fps),
-            "capture_fps": capture_meta.get("capture_fps", args.fps),
-            "output_fps": capture_meta.get("output_fps", args.fps),
-            "capture_mode": capture_meta["mode"],
-            "actual_duration_seconds": capture_meta.get("actual_duration_seconds"),
-            "frame_count": capture_meta.get("frame_count"),
+            "fps": fps,
+            "capture_fps": fps,
+            "output_fps": fps,
+            "capture_mode": "deterministic",
+            "actual_duration_seconds": round(actual_duration, 4),
+            "frame_count": frame_count,
+            "lead_in_trimmed": start_frame,
             "crop": dataclasses.asdict(crop) if crop else None,
             "duration_seconds": round(job.duration_seconds, 4),
             "output": rel(target),
         }
     except Exception as exc:  # noqa: BLE001 - manifest should record all job failures.
         return error_payload(job, str(exc))
-
-
-def capture_job_video(
-    job_id: str,
-    job: ExportJob,
-    args: argparse.Namespace,
-    server: ExportServer,
-    base_url: str,
-    tmp_dir: Path,
-) -> tuple[Path, dict[str, Any]]:
-    modes = [args.capture_mode]
-    if args.capture_mode == "auto":
-        modes = ["realtime", "deterministic"] if args.deterministic_fallback else ["realtime"]
-
-    errors: list[str] = []
-    for mode in modes:
-        capture_id = f"{job_id}-{mode}"
-        try:
-            if mode == "realtime":
-                capture_path = capture_realtime_video(capture_id, job, args, server, base_url, tmp_dir)
-                actual_duration = video_duration(capture_path)
-                if abs(actual_duration - job.duration_seconds) > args.duration_tolerance:
-                    message = (
-                        f"realtime duration drifted to {actual_duration:.3f}s; "
-                        f"expected {job.duration_seconds:.3f}s"
-                    )
-                    if args.capture_mode == "auto":
-                        errors.append(message)
-                        continue
-                    raise RuntimeError(message)
-                return capture_path, {
-                    "mode": mode,
-                    "actual_duration_seconds": round(actual_duration, 4),
-                    "frame_count": None,
-                    "capture_dimensions": list(actual_capture_dimensions(job, effective_render_scale(job, args))),
-                    "render_scale": effective_render_scale(job, args),
-                    "capture_fps": effective_capture_fps(job, args, effective_render_scale(job, args)),
-                    "output_fps": args.fps,
-                    "crop": None,
-                }
-
-            if mode == "deterministic":
-                capture_path, frame_count, crop = capture_deterministic_video(capture_id, job, args, server, base_url, tmp_dir)
-                actual_duration = video_duration(capture_path)
-                return capture_path, {
-                    "mode": mode,
-                    "actual_duration_seconds": round(actual_duration, 4),
-                    "frame_count": frame_count,
-                    "fallback_reason": errors[-1] if errors else None,
-                    "capture_dimensions": list(actual_capture_dimensions(job, effective_render_scale(job, args))),
-                    "render_scale": effective_render_scale(job, args),
-                    "capture_fps": effective_capture_fps(job, args, effective_render_scale(job, args)),
-                    "output_fps": args.fps,
-                    "crop": crop,
-                }
-
-            raise RuntimeError(f"unsupported capture mode: {mode}")
-        except Exception as exc:  # noqa: BLE001 - try the configured fallback.
-            if args.capture_mode != "auto" or mode == modes[-1]:
-                raise
-            errors.append(str(exc))
-
-    raise RuntimeError("; ".join(errors) or "capture failed")
-
-
-def capture_realtime_video(
-    capture_id: str,
-    job: ExportJob,
-    args: argparse.Namespace,
-    server: ExportServer,
-    base_url: str,
-    tmp_dir: Path,
-) -> Path:
-    capture_path = tmp_dir / f"{capture_id}.realtime.webm"
-    server.capture_paths[capture_id] = capture_path
-    chrome = None
-    try:
-        scale = str(effective_render_scale(job, args))
-        fps = effective_capture_fps(job, args, int(scale))
-        url = build_preview_export_url(base_url, capture_id, job, args, runtime_urls(args), fps, "realtime", scale)
-        chrome = launch_chrome(args, url, tmp_dir / f"chrome-{capture_id}")
-        capture_result = wait_for_capture(server, capture_id, args.capture_timeout)
-        if not capture_result.get("ok"):
-            raise RuntimeError(capture_result.get("message", "browser capture failed"))
-        if not capture_path.exists() or capture_path.stat().st_size == 0:
-            raise RuntimeError("browser realtime capture was empty")
-        return capture_path
-    finally:
-        if chrome is not None:
-            terminate_process(chrome)
-        server.capture_paths.pop(capture_id, None)
-
-
-def capture_deterministic_video(
-    capture_id: str,
-    job: ExportJob,
-    args: argparse.Namespace,
-    server: ExportServer,
-    base_url: str,
-    tmp_dir: Path,
-) -> tuple[Path, int, VideoCrop | None]:
-    frame_dir = tmp_dir / f"{capture_id}-frames"
-    frame_dir.mkdir(parents=True)
-    capture_path = tmp_dir / f"{capture_id}.deterministic.webm"
-    server.frame_dirs[capture_id] = frame_dir
-    chrome = None
-    try:
-        scale = effective_render_scale(job, args)
-        fps = effective_capture_fps(job, args, scale)
-        url = build_preview_export_url(base_url, capture_id, job, args, runtime_urls(args), fps, "deterministic", str(scale))
-        chrome = launch_chrome(args, url, tmp_dir / f"chrome-{capture_id}")
-        capture_result = wait_for_capture(server, capture_id, args.capture_timeout)
-        if not capture_result.get("ok"):
-            raise RuntimeError(capture_result.get("message", "browser capture failed"))
-        frame_count = int(capture_result.get("frames") or 0)
-        if frame_count <= 0:
-            raise RuntimeError("browser did not report exported frames")
-        missing = missing_frames(frame_dir, frame_count)
-        if missing:
-            raise RuntimeError(f"browser export missed frame(s): {format_missing_frames(missing)}")
-        crop = None
-        target_width = job.final_width
-        target_height = job.final_height
-        if should_crop_job(job, args):
-            crop = detect_frame_crop(
-                frame_dir,
-                frame_count,
-                scaled_crop_padding(job, args, scale),
-                job_uses_alpha(job, args),
-                args.opaque_crop_threshold,
-            )
-            if crop is not None:
-                target_width, target_height = scaled_crop_dimensions(crop, scale)
-        encode_frames(frame_dir, capture_path, args, target_width, target_height, crop, fps, args.fps, job_uses_alpha(job, args))
-        return capture_path, frame_count, crop
-    finally:
-        if chrome is not None:
-            terminate_process(chrome)
-        server.frame_dirs.pop(capture_id, None)
 
 
 def runtime_urls(args: argparse.Namespace) -> list[str]:
@@ -811,33 +708,30 @@ def runtime_urls(args: argparse.Namespace) -> list[str]:
     return urls
 
 
-def build_preview_export_url(
-    base_url: str,
-    job_id: str,
-    job: ExportJob,
-    args: argparse.Namespace,
-    runtime_url_list: list[str],
-    fps: int,
-    capture_mode: str,
-    scale: str,
-) -> str:
+def build_controller_url(base_url: str, runtime_url_list: list[str]) -> str:
     params = {
         "export": "1",
-        "exportId": job_id,
-        "captureMode": capture_mode,
-        "json": rel(job.source_json),
-        "atlas": rel(job.source_atlas),
-        "anim": job.animations[0] if job.animations else "",
-        "animations": ",".join(job.animations),
-        "width": str(job.capture_width),
-        "height": str(job.capture_height),
-        "fps": str(fps),
-        "duration": f"{job.duration_seconds:.4f}",
-        "scale": scale,
-        "transparent": "1" if job_uses_alpha(job, args) else "0",
+        "controller": "1",
         "runtime": "|".join(runtime_url_list),
     }
     return base_url + "/spine-preview.html?" + urllib.parse.urlencode(params)
+
+
+def job_descriptor(capture_id: str, job: ExportJob, args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "id": capture_id,
+        "group": job.group,
+        "json": rel(job.source_json),
+        "atlas": rel(job.source_atlas),
+        "anim": job.animations[0] if job.animations else "",
+        "animations": list(job.animations),
+        "width": job.capture_width,
+        "height": job.capture_height,
+        "fps": args.fps,
+        "duration": round(job.duration_seconds, 4),
+        "scale": str(render_scale(args)),
+        "transparent": job_uses_alpha(job, args),
+    }
 
 
 def launch_chrome(args: argparse.Namespace, url: str, user_data_dir: Path) -> subprocess.Popen[bytes]:
@@ -865,7 +759,7 @@ def launch_chrome(args: argparse.Namespace, url: str, user_data_dir: Path) -> su
 
 
 def missing_frames(frame_dir: Path, frame_count: int) -> list[int]:
-    return [index for index in range(frame_count) if not (frame_dir / f"frame_{index:06d}.png").exists()]
+    return [index for index in range(frame_count) if not (frame_dir / f"frame_{index:06d}.rgba").exists()]
 
 
 def format_missing_frames(frames: list[int]) -> str:
@@ -876,37 +770,6 @@ def format_missing_frames(frames: list[int]) -> str:
 
 def render_scale(args: argparse.Namespace) -> int:
     return int(args.render_scale)
-
-
-def effective_render_scale(job: ExportJob, args: argparse.Namespace) -> int:
-    scale = render_scale(args)
-    while scale > 1:
-        width, height = actual_capture_dimensions(job, scale)
-        exceeds_edge = args.max_capture_edge > 0 and max(width, height) > args.max_capture_edge
-        exceeds_pixels = args.max_capture_pixels > 0 and width * height > args.max_capture_pixels
-        if not exceeds_edge and not exceeds_pixels:
-            break
-        scale -= 1
-    return scale
-
-
-def effective_capture_fps(job: ExportJob, args: argparse.Namespace, scale: int) -> int:
-    requested_fps = max(1, int(args.fps))
-    fps = requested_fps
-    width, height = actual_capture_dimensions(job, scale)
-    is_large_capture = scale < render_scale(args) or (
-        args.large_capture_pixels > 0 and width * height > args.large_capture_pixels
-    )
-    if not is_large_capture:
-        return fps
-    if args.large_capture_fps > 0:
-        fps = min(fps, int(args.large_capture_fps))
-    if args.max_deterministic_megapixel_frames > 0:
-        budget = args.max_deterministic_megapixel_frames * 1_000_000
-        max_fps = math.floor(budget / max(1.0, width * height * job.duration_seconds))
-        fps = min(fps, max_fps)
-    minimum = min(requested_fps, max(1, int(args.min_large_capture_fps)))
-    return max(minimum, fps)
 
 
 def actual_capture_dimensions(job: ExportJob, scale: int) -> tuple[int, int]:
@@ -934,26 +797,64 @@ def scaled_crop_dimensions(crop: VideoCrop, scale: int) -> tuple[int, int]:
     return even_floor(crop.width / scale), even_floor(crop.height / scale)
 
 
+def raw_input_args(width: int, height: int, fps: int) -> list[str]:
+    return [
+        "-f",
+        "rawvideo",
+        "-pixel_format",
+        "rgba",
+        "-video_size",
+        f"{width}x{height}",
+        "-framerate",
+        str(max(1, int(fps))),
+    ]
+
+
+def feed_raw_frames(stdin: Any, frame_dir: Path, count: int, start: int = 0) -> None:
+    try:
+        for index in range(start, count):
+            stdin.write((frame_dir / f"frame_{index:06d}.rgba").read_bytes())
+    except BrokenPipeError:
+        pass
+    finally:
+        with contextlib.suppress(BrokenPipeError, OSError):
+            stdin.close()
+
+
+def run_ffmpeg_raw(input_args: list[str], frame_dir: Path, count: int, output_args: list[str], start: int = 0) -> tuple[int, str]:
+    """Pipe frame files `[start, count)` of raw RGBA into ffmpeg in order.
+
+    The browser now hands us raw GPU pixels (no PNG), so ffmpeg ingests them as a
+    rawvideo stream over stdin. A writer thread streams the frames while the main
+    thread drains stderr, so neither pipe can deadlock on a full buffer.
+    """
+    command = ["ffmpeg", "-hide_banner", "-y", *input_args, "-i", "-", *output_args]
+    proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    writer = threading.Thread(target=feed_raw_frames, args=(proc.stdin, frame_dir, count, start), daemon=True)
+    writer.start()
+    stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
+    returncode = proc.wait()
+    writer.join(timeout=5)
+    return returncode, stderr
+
+
 def encode_frames(
     frame_dir: Path,
     target: Path,
     args: argparse.Namespace,
+    frame_width: int,
+    frame_height: int,
     width: int,
     height: int,
+    frame_count: int,
     crop: VideoCrop | None = None,
     capture_fps: int | None = None,
     output_fps: int | None = None,
     alpha: bool = True,
+    start_frame: int = 0,
 ) -> None:
-    filters = encode_filters(width, height, crop, output_fps or args.fps)
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-y",
-        "-framerate",
-        str(capture_fps or args.fps),
-        "-i",
-        str(frame_dir / "frame_%06d.png"),
+    filters = encode_filters(width, height, crop, output_fps or args.fps, alpha)
+    output_args = [
         "-vf",
         filters,
         "-an",
@@ -968,24 +869,33 @@ def encode_frames(
         "0",
         "-crf",
         str(args.vp9_crf),
-        str(target),
     ]
     if alpha:
-        command[-1:-1] = ["-metadata:s:v:0", "alpha_mode=1"]
-    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=False)
-    if result.returncode != 0:
-        raise RuntimeError("ffmpeg frame encode failed: " + result.stderr.strip())
+        output_args.extend(["-metadata:s:v:0", "alpha_mode=1"])
+    output_args.append(str(target))
+    input_args = raw_input_args(frame_width, frame_height, capture_fps or args.fps)
+    returncode, stderr = run_ffmpeg_raw(input_args, frame_dir, frame_count, output_args, start_frame)
+    if returncode != 0:
+        raise RuntimeError("ffmpeg frame encode failed: " + stderr.strip())
     if not target.exists() or target.stat().st_size == 0:
         raise RuntimeError("ffmpeg frame encode produced an empty file")
 
 
-def encode_filters(width: int, height: int, crop: VideoCrop | None = None, fps: int | None = None) -> str:
-    filters = []
+def encode_filters(
+    width: int, height: int, crop: VideoCrop | None = None, fps: int | None = None, alpha: bool = True
+) -> str:
+    # vflip undoes the bottom-up orientation of gl.readPixels before any crop/scale.
+    filters = ["vflip"]
     if crop is not None:
         filters.append(f"crop={crop.width}:{crop.height}:{crop.x}:{crop.y}")
     if fps is not None:
         filters.append(f"fps={max(1, int(fps))}")
     filters.append(f"scale={width}:{height}:flags=lanczos")
+    # Spine renders premultiplied; scale in that space (clean edges) then convert
+    # back to straight alpha for the yuva420p webm. Without this, semi-transparent
+    # pixels (e.g. blush) keep their premultiplied RGB and show wrong colors.
+    if alpha:
+        filters.append("unpremultiply=inplace=1")
     return ",".join(filters)
 
 
@@ -1003,54 +913,61 @@ def vp9_encoder_options(args: argparse.Namespace) -> list[str]:
     return options
 
 
-def detect_video_crop(path: Path, padding: int, alpha: bool) -> VideoCrop | None:
-    width, height = video_dimensions(path)
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-    ]
-    if alpha:
-        command.extend(["-c:v", "libvpx-vp9"])
-    command.extend([
-        "-i",
-        str(path),
-        "-vf",
-        cropdetect_filter(alpha),
-        "-frames:v",
-        "180",
-        "-f",
-        "null",
-        "-",
-    ])
-    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=False)
-    if result.returncode != 0:
-        raise RuntimeError("ffmpeg crop detection failed: " + result.stderr.strip())
-
-    return detect_crop_from_output(width, height, result.stderr, padding)
-
-
-def detect_frame_crop(frame_dir: Path, frame_count: int, padding: int, alpha: bool, opaque_threshold: int) -> VideoCrop | None:
-    width, height = video_dimensions(frame_dir / "frame_000000.png")
+def detect_frame_crop(
+    frame_dir: Path,
+    frame_count: int,
+    width: int,
+    height: int,
+    padding: int,
+    alpha: bool,
+    opaque_threshold: int,
+) -> VideoCrop | None:
     if not alpha:
         return detect_opaque_frame_crop(frame_dir, frame_count, width, height, padding, opaque_threshold)
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-i",
-        str(frame_dir / "frame_%06d.png"),
-        "-vf",
-        cropdetect_filter(alpha),
-        "-frames:v",
-        str(min(180, frame_count)),
-        "-f",
-        "null",
-        "-",
-    ]
-    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=False)
-    if result.returncode != 0:
-        raise RuntimeError("ffmpeg frame crop detection failed: " + result.stderr.strip())
+    sample = min(180, frame_count)
+    input_args = raw_input_args(width, height, 30)
+    output_args = ["-vf", "vflip," + cropdetect_filter(alpha), "-frames:v", str(sample), "-f", "null", "-"]
+    returncode, stderr = run_ffmpeg_raw(input_args, frame_dir, sample, output_args)
+    if returncode != 0:
+        raise RuntimeError("ffmpeg frame crop detection failed: " + stderr.strip())
+    return detect_crop_from_output(width, height, stderr, padding)
 
-    return detect_crop_from_output(width, height, result.stderr, padding)
+
+def detect_card_lead_in(frame_dir: Path, frame_count: int, width: int, height: int) -> int:
+    """Return the first frame where a zoom-in card has reached its settled size.
+
+    Card animations zoom the art in from small to full size. With a single fixed
+    crop the smaller intro frames leave a transparent margin that players render as
+    black, so we drop those lead-in frames and start playback at the settled card.
+    """
+    import numpy as np
+
+    if frame_count <= 2:
+        return 0
+    widths = np.zeros(frame_count, dtype=np.int32)
+    heights = np.zeros(frame_count, dtype=np.int32)
+    for index in range(frame_count):
+        alpha = np.frombuffer((frame_dir / f"frame_{index:06d}.rgba").read_bytes(), np.uint8)
+        alpha = alpha.reshape(height, width, 4)[:, :, 3]
+        cols = np.where(np.any(alpha > 16, axis=0))[0]
+        rows = np.where(np.any(alpha > 16, axis=1))[0]
+        if cols.size and rows.size:
+            widths[index] = cols[-1] - cols[0] + 1
+            heights[index] = rows[-1] - rows[0] + 1
+    half = frame_count // 2
+    target_w = float(np.median(widths[half:]))
+    target_h = float(np.median(heights[half:]))
+    if target_w <= 0 or target_h <= 0:
+        return 0
+    settled = np.where((widths >= 0.97 * target_w) & (heights >= 0.97 * target_h))[0]
+    if settled.size == 0:
+        return 0
+    start = int(settled[0])
+    # Never gut the clip: if the card only plateaus past the midpoint (continuous
+    # zoom, no settled hold), leave it untrimmed rather than drop most of it.
+    if start > half:
+        return 0
+    return start
 
 
 def detect_opaque_frame_crop(
@@ -1062,23 +979,14 @@ def detect_opaque_frame_crop(
     threshold: int,
 ) -> VideoCrop | None:
     similarity = max(0.0, min(1.0, max(0, int(threshold)) / 255.0))
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-i",
-        str(frame_dir / "frame_%06d.png"),
-        "-vf",
-        f"colorkey=0x0f121d:similarity={similarity:.4f}:blend=0,format=rgba,alphaextract,cropdetect=limit=1:round=2:reset=0",
-        "-frames:v",
-        str(min(180, frame_count)),
-        "-f",
-        "null",
-        "-",
-    ]
-    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=False)
-    if result.returncode != 0:
-        raise RuntimeError("ffmpeg opaque frame crop detection failed: " + result.stderr.strip())
-    return detect_crop_from_output(width, height, result.stderr, padding)
+    sample = min(180, frame_count)
+    input_args = raw_input_args(width, height, 30)
+    filters = f"vflip,colorkey=0x0f121d:similarity={similarity:.4f}:blend=0,format=rgba,alphaextract,cropdetect=limit=1:round=2:reset=0"
+    output_args = ["-vf", filters, "-frames:v", str(sample), "-f", "null", "-"]
+    returncode, stderr = run_ffmpeg_raw(input_args, frame_dir, sample, output_args)
+    if returncode != 0:
+        raise RuntimeError("ffmpeg opaque frame crop detection failed: " + stderr.strip())
+    return detect_crop_from_output(width, height, stderr, padding)
 
 
 def cropdetect_filter(alpha: bool) -> str:
@@ -1194,46 +1102,6 @@ def packet_duration(path: Path) -> float:
     return end_time
 
 
-def transcode_video(
-    source: Path,
-    target: Path,
-    args: argparse.Namespace,
-    width: int,
-    height: int,
-    crop: VideoCrop | None = None,
-    alpha: bool = True,
-) -> None:
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-y",
-        "-i",
-        str(source),
-        "-vf",
-        encode_filters(width, height, crop),
-        "-an",
-        "-c:v",
-        "libvpx-vp9",
-        *vp9_encoder_options(args),
-        "-pix_fmt",
-        "yuva420p" if alpha else "yuv420p",
-        "-auto-alt-ref",
-        "0",
-        "-b:v",
-        "0",
-        "-crf",
-        str(args.vp9_crf),
-        str(target),
-    ]
-    if alpha:
-        command[-1:-1] = ["-metadata:s:v:0", "alpha_mode=1"]
-    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=False)
-    if result.returncode != 0:
-        raise RuntimeError("ffmpeg transcode failed: " + result.stderr.strip())
-    if not target.exists() or target.stat().st_size == 0:
-        raise RuntimeError("ffmpeg transcode produced an empty file")
-
-
 def even_floor(value: int) -> int:
     number = max(2, int(value))
     return number if number % 2 == 0 else number - 1
@@ -1246,12 +1114,19 @@ def clamp_even(value: int, minimum: int, maximum: int) -> int:
     return clamped - 1 if clamped > minimum else clamped + 1
 
 
-def wait_for_capture(server: ExportServer, job_id: str, timeout: float) -> dict[str, Any]:
+def wait_for_capture(
+    server: ExportServer,
+    job_id: str,
+    timeout: float,
+    chrome: subprocess.Popen[bytes] | None = None,
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return {"ok": False, "id": job_id, "message": f"timed out after {timeout:.1f}s"}
+        if chrome is not None and chrome.poll() is not None:
+            return {"ok": False, "id": job_id, "message": f"Chrome exited early (code {chrome.returncode})"}
         try:
             result = server.results.get(timeout=min(0.5, remaining))
         except queue.Empty:
