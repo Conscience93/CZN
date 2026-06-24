@@ -14,6 +14,7 @@ from char_info.autocreate_partner_pages import auto_create_partner_pages
 from char_info.cards import save_cards
 from char_info.char_images import upload_character_images
 from char_info.characters import save_character_info
+from char_info.combatant_stats import update_combatant_stats_pages
 from char_info.counseling import save_counseling
 from char_info.ego_manifestation import save_ego_manifestations
 from char_info.favourite_gifts import save_favourite_gifts
@@ -27,6 +28,7 @@ def char_info():
     save_favourite_gifts()
     upload_character_images()
     auto_create_combatant_pages()
+    update_combatant_stats_pages()
     # save_cards()
     save_counseling()
     auto_create_counseling_pages()
