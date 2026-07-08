@@ -59,6 +59,25 @@ class Character:
     slug: str
 
 
+@dataclasses.dataclass(frozen=True)
+class LiveeventLayer:
+    """A companion Spine skeleton layered with a liveevent character's main skeleton.
+
+    Liveevent "cutin" scenes are split across several skeleton files sharing one
+    coordinate space: bg_b (background, behind the character), bg_f (background,
+    in front of the character), eff (effects, on top of everything), fade (a
+    dim/transition overlay), and sometimes intro. All share the same root-bone
+    origin, so no separate offset/layout data is needed to align them.
+    """
+
+    role: str
+    index: int | None
+    source_json: Path
+    source_atlas: Path
+    animation: str | None
+    rendered: bool
+
+
 @dataclasses.dataclass
 class ExportJob:
     group: str
@@ -75,6 +94,8 @@ class ExportJob:
     capture_width: int
     capture_height: int
     duration_seconds: float
+    layers: tuple[LiveeventLayer, ...] = ()
+    stage_frame: tuple[float, float, float, float] | None = None
 
     @property
     def key(self) -> str:
@@ -216,6 +237,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-edge", type=int, default=0, help="Optional maximum output width/height.")
     parser.add_argument("--card-max-edge", type=int, default=4096, help="Optional maximum card capture width/height before cropping.")
     parser.add_argument("--liveevent-max-edge", type=int, default=4096, help="Optional maximum liveevent capture width/height before cropping. Liveevent stage skeletons can be huge (e.g. panoramic scenes) and liveevent always renders at 4x, so an uncapped outlier can exceed the browser's array-buffer/texture limits.")
+    parser.add_argument("--liveevent-render-roles", default="bg_b,bg_f,eff", help="Comma-separated companion layer roles to composite into the liveevent stable-pose capture (from bg_b, bg_f, eff, fade, intro).")
     parser.add_argument("--duration-pad", type=float, default=0.25)
     parser.add_argument("--capture-timeout", type=float, default=360.0)
     parser.add_argument("--force-swiftshader", action="store_true", help="Force Chrome's software WebGL renderer. Off by default so hardware GPU can be used.")
@@ -231,6 +253,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    args.liveevent_render_roles = frozenset(
+        role.strip() for role in args.liveevent_render_roles.split(",") if role.strip()
+    )
     groups = parse_groups(args.type)
     characters = filter_characters(load_playable_characters(), args.character)
     manifest: dict[str, Any] = {
@@ -254,6 +279,8 @@ def main() -> int:
             "card_trim": not args.no_card_trim,
             "max_edge": args.max_edge,
             "card_max_edge": args.card_max_edge,
+            "liveevent_max_edge": args.liveevent_max_edge,
+            "liveevent_render_roles": sorted(args.liveevent_render_roles),
             "duration_pad": args.duration_pad,
             "force_swiftshader": args.force_swiftshader,
             "overwrite": args.overwrite,
@@ -291,10 +318,18 @@ def main() -> int:
 
 EXPORT_GROUPS = {"battle_ready", "model", "card", "liveevent"}
 
-# The starting frames of 2_step1_play are the most stable representative pose for a
-# liveevent sequence: later frames cycle through dialogue steps and expressions, but
-# early frames settle into the resting pose the sequence opens on.
-LIVEEVENT_ANIMATION = "2_step1_play"
+# lobby is the idle/resting animation shared by the main character and its
+# companion layers alike, and is more visually stable than the numbered step
+# animations (which cycle through dialogue-specific poses/expressions).
+LIVEEVENT_ANIMATION = "lobby"
+
+# Companion layer filenames look like liveevent_{id}_bg_b_01.json, liveevent_{id}_fade.json, etc.
+LIVEEVENT_LAYER_SUFFIX_RE = re.compile(r"^(bg_b|bg_f|eff|intro)_(\d+)$")
+# fade/intro layers only carry intro/outro transition animations (no idle/lobby
+# state), so they're assumed invisible during a settled mid-story pose and are
+# excluded from the composite by default; --liveevent-render-roles can override this.
+LIVEEVENT_DEFAULT_RENDER_ROLES = frozenset({"bg_b", "bg_f", "eff"})
+LIVEEVENT_ROLE_DRAW_ORDER = {"bg_b": 0, "bg_f": 2, "eff": 3}  # main character implicitly sits at 1
 
 
 def parse_groups(raw: str) -> set[str]:
@@ -351,6 +386,76 @@ def slugify(value: str) -> str:
     return value
 
 
+def classify_liveevent_layer(suffix: str) -> tuple[str, int | None]:
+    if suffix == "fade":
+        return "fade", None
+    match = LIVEEVENT_LAYER_SUFFIX_RE.match(suffix)
+    if match:
+        return match.group(1), int(match.group(2))
+    print(f"  warning: unrecognized liveevent layer suffix '{suffix}'; treating as unknown/unrendered", flush=True)
+    return "unknown", None
+
+
+def discover_liveevent_layers(char: Character) -> list[LiveeventLayer]:
+    layers: list[LiveeventLayer] = []
+    prefix = f"liveevent_{char.id}_"
+    for source_json in sorted(MODEL_DIR.glob(f"{prefix}*.json")):
+        suffix = source_json.stem[len(prefix):]
+        source_atlas = source_json.with_suffix(".atlas")
+        if not source_atlas.exists():
+            print(f"  warning: liveevent layer {source_json.name} missing atlas; skipping", flush=True)
+            continue
+        role, index = classify_liveevent_layer(suffix)
+        layers.append(
+            LiveeventLayer(
+                role=role,
+                index=index,
+                source_json=source_json,
+                source_atlas=source_atlas,
+                animation=None,
+                rendered=False,
+            )
+        )
+    return layers
+
+
+def canonical_stage_layer(layers: list[LiveeventLayer]) -> LiveeventLayer | None:
+    def best(role: str) -> LiveeventLayer | None:
+        candidates = sorted(
+            (layer for layer in layers if layer.role == role),
+            key=lambda layer: layer.index if layer.index is not None else 0,
+        )
+        return candidates[0] if candidates else None
+
+    return best("bg_b") or best("bg_f")
+
+
+def choose_layer_animation(available: list[str]) -> str | None:
+    if "lobby" in available:
+        return "lobby"
+    if "animation1" in available:
+        return "animation1"
+    return available[0] if available else None
+
+
+def resolve_liveevent_layer_animations(
+    layers: list[LiveeventLayer], render_roles: frozenset[str]
+) -> list[LiveeventLayer]:
+    resolved: list[LiveeventLayer] = []
+    for layer in layers:
+        data = load_json(layer.source_json)
+        available = list(data.get("animations", {}))
+        resolved.append(
+            dataclasses.replace(
+                layer,
+                animation=choose_layer_animation(available),
+                rendered=layer.role in render_roles,
+            )
+        )
+    resolved.sort(key=lambda layer: (LIVEEVENT_ROLE_DRAW_ORDER.get(layer.role, 99), layer.index if layer.index is not None else 0))
+    return resolved
+
+
 def build_jobs(characters: list[Character], groups: set[str], args: argparse.Namespace) -> tuple[list[ExportJob], list[dict[str, Any]]]:
     jobs: list[ExportJob] = []
     skipped: list[dict[str, Any]] = []
@@ -379,6 +484,23 @@ def build_jobs(characters: list[Character], groups: set[str], args: argparse.Nam
                     args,
                 )
         if "liveevent" in groups:
+            layers = resolve_liveevent_layer_animations(
+                discover_liveevent_layers(char), args.liveevent_render_roles
+            )
+            stage_layer = canonical_stage_layer(layers)
+            frame_override = None
+            if stage_layer is not None:
+                stage_data = load_json(stage_layer.source_json)
+                stage_skeleton = stage_data.get("skeleton", {})
+                stage_width = float(stage_skeleton.get("width") or 0)
+                stage_height = float(stage_skeleton.get("height") or 0)
+                if stage_width > 0 and stage_height > 0:
+                    frame_override = (
+                        float(stage_skeleton.get("x") or 0),
+                        float(stage_skeleton.get("y") or 0),
+                        stage_width,
+                        stage_height,
+                    )
             add_job(
                 jobs,
                 skipped,
@@ -388,6 +510,8 @@ def build_jobs(characters: list[Character], groups: set[str], args: argparse.Nam
                 "liveevent",
                 (LIVEEVENT_ANIMATION,),
                 args,
+                layers=tuple(layers),
+                frame_override=frame_override,
             )
         if "card" in groups:
             card_jsons = sorted(CARD_DIR.glob(f"unique_{char.id}_*.json"))
@@ -420,6 +544,8 @@ def add_job(
     animations: tuple[str, ...],
     args: argparse.Namespace,
     data: dict[str, Any] | None = None,
+    layers: tuple[LiveeventLayer, ...] = (),
+    frame_override: tuple[float, float, float, float] | None = None,
 ) -> None:
     source_atlas = source_json.with_suffix(".atlas")
     if not source_json.exists() or not source_atlas.exists():
@@ -437,6 +563,14 @@ def add_job(
     if intrinsic_width <= 0 or intrinsic_height <= 0:
         skipped.append(skip_payload(char, group, source_json, "missing intrinsic skeleton width/height"))
         return
+    # Liveevent framing normally comes from the shared bg_b/bg_f "stage" rect
+    # (frame_override), not the main skeleton's own declared bounds -- the latter
+    # has been observed both far too small and wildly too large relative to the
+    # actual composited scene.
+    if frame_override is not None:
+        _, _, frame_width, frame_height = frame_override
+    else:
+        frame_width, frame_height = intrinsic_width, intrinsic_height
     output_scale = group_output_scale(group, args)
     if group == "card":
         max_edge = args.card_max_edge
@@ -444,7 +578,7 @@ def add_job(
         max_edge = args.liveevent_max_edge
     else:
         max_edge = args.max_edge
-    final_width, final_height = compute_dimensions(intrinsic_width, intrinsic_height, output_scale, args.padding, max_edge)
+    final_width, final_height = compute_dimensions(frame_width, frame_height, output_scale, args.padding, max_edge)
     capture_width = final_width
     capture_height = final_height
     duration = sum(animation_duration(data["animations"][animation]) for animation in animations)
@@ -465,6 +599,8 @@ def add_job(
             capture_width=capture_width,
             capture_height=capture_height,
             duration_seconds=duration,
+            layers=layers,
+            stage_frame=frame_override,
         )
     )
 
@@ -530,6 +666,10 @@ def print_dry_run(jobs: list[ExportJob], skipped: list[dict[str, Any]], args: ar
     for job in jobs:
         scale = job_render_scale(job, args)
         capture_width, capture_height = actual_capture_dimensions(job, scale)
+        layer_summary = ""
+        if job.group == "liveevent" and job.layers:
+            rendered = sum(1 for layer in job.layers if layer.rendered)
+            layer_summary = f" layers {rendered}/{len(job.layers)}"
         print(
             f"{job.key}: {rel(job.source_json)} "
             f"{'+'.join(job.animations)} "
@@ -537,6 +677,7 @@ def print_dry_run(jobs: list[ExportJob], skipped: list[dict[str, Any]], args: ar
             f"capture {capture_width}x{capture_height} "
             f"scale {scale}x "
             f"fps {args.fps}"
+            f"{layer_summary}"
         )
     if skipped:
         print(f"\nSkipped before export: {len(skipped)}")
@@ -691,7 +832,7 @@ def finalize_capture(
             raise RuntimeError("browser did not report frame dimensions")
 
         if job.group == "liveevent":
-            return finalize_png_capture(job, frame_dir, target, frame_width, frame_height, args, scale, alpha)
+            return finalize_png_capture(job, frame_dir, target, frame_width, frame_height, frame_count, args, scale, alpha)
 
         crop = None
         target_width = job.final_width
@@ -749,35 +890,69 @@ def finalize_capture(
         return error_payload(job, str(exc))
 
 
+def encode_liveevent_frame(
+    job: ExportJob,
+    frame_dir: Path,
+    target: Path,
+    frame_width: int,
+    frame_height: int,
+    frame_index: int,
+    args: argparse.Namespace,
+    scale: int,
+    alpha: bool,
+) -> tuple[VideoCrop | None, tuple[int, int]]:
+    crop = None
+    target_width = job.final_width
+    target_height = job.final_height
+    if should_crop_job(job, args):
+        crop = detect_frame_crop(
+            frame_dir,
+            1,
+            frame_width,
+            frame_height,
+            scaled_crop_padding(job, args, scale),
+            alpha,
+            args.opaque_crop_threshold,
+            start_frame=frame_index,
+        )
+        if crop is not None:
+            target_width, target_height = scaled_crop_dimensions(crop, scale)
+
+    encode_png_frame(
+        frame_dir, target, frame_width, frame_height, target_width, target_height, crop, alpha, start_frame=frame_index
+    )
+    return crop, video_dimensions(target)
+
+
 def finalize_png_capture(
     job: ExportJob,
     frame_dir: Path,
     target: Path,
     frame_width: int,
     frame_height: int,
+    frame_count: int,
     args: argparse.Namespace,
     scale: int,
     alpha: bool,
 ) -> dict[str, Any]:
     try:
-        crop = None
-        target_width = job.final_width
-        target_height = job.final_height
-        if should_crop_job(job, args):
-            crop = detect_frame_crop(
-                frame_dir,
-                1,
-                frame_width,
-                frame_height,
-                scaled_crop_padding(job, args, scale),
-                alpha,
-                args.opaque_crop_threshold,
+        # Companion layers (if any) yield a second frame: frame 0 is the character
+        # alone, frame 1 is the full bg_b/character/bg_f/eff composite. The
+        # composite keeps the canonical output filename; the solo render is saved
+        # alongside it so a broken composite (bad layer order, misaligned stage
+        # frame) is easy to spot by comparing the two.
+        output_solo = None
+        if frame_count >= 2:
+            solo_target = target.with_name(f"{target.stem}_solo{target.suffix}")
+            encode_liveevent_frame(job, frame_dir, solo_target, frame_width, frame_height, 0, args, scale, alpha)
+            output_solo = rel(solo_target)
+            crop, (output_width, output_height) = encode_liveevent_frame(
+                job, frame_dir, target, frame_width, frame_height, 1, args, scale, alpha
             )
-            if crop is not None:
-                target_width, target_height = scaled_crop_dimensions(crop, scale)
-
-        encode_png_frame(frame_dir, target, frame_width, frame_height, target_width, target_height, crop, alpha)
-        output_width, output_height = video_dimensions(target)
+        else:
+            crop, (output_width, output_height) = encode_liveevent_frame(
+                job, frame_dir, target, frame_width, frame_height, 0, args, scale, alpha
+            )
         return {
             "ok": True,
             "key": job.key,
@@ -794,8 +969,20 @@ def finalize_png_capture(
             "render_scale": scale,
             "capture_mode": "single_frame_png",
             "crop": dataclasses.asdict(crop) if crop else None,
-            "frame_count": 1,
+            "frame_count": frame_count,
             "output": rel(target),
+            "output_solo": output_solo,
+            "background_layers": [
+                {
+                    "role": layer.role,
+                    "index": layer.index,
+                    "source_json": rel(layer.source_json),
+                    "animation": layer.animation,
+                    "rendered": layer.rendered,
+                }
+                for layer in job.layers
+            ],
+            "stage_frame": list(job.stage_frame) if job.stage_frame else None,
         }
     except Exception as exc:  # noqa: BLE001 - manifest should record all job failures.
         return error_payload(job, str(exc))
@@ -837,6 +1024,27 @@ def job_descriptor(capture_id: str, job: ExportJob, args: argparse.Namespace, sc
         "duration": round(job.duration_seconds, 4),
         "scale": str(scale),
         "transparent": job_uses_alpha(job, args),
+        "layers": [
+            {
+                "role": layer.role,
+                "index": layer.index,
+                "json": rel(layer.source_json),
+                "atlas": rel(layer.source_atlas),
+                "animation": layer.animation,
+            }
+            for layer in job.layers
+            if layer.rendered
+        ],
+        "stage_frame": (
+            {
+                "x": job.stage_frame[0],
+                "y": job.stage_frame[1],
+                "width": job.stage_frame[2],
+                "height": job.stage_frame[3],
+            }
+            if job.stage_frame
+            else None
+        ),
     }
 
 
@@ -1015,6 +1223,7 @@ def encode_png_frame(
     height: int,
     crop: VideoCrop | None,
     alpha: bool,
+    start_frame: int = 0,
 ) -> None:
     filters = encode_filters(width, height, crop, None, alpha)
     output_args = [
@@ -1029,7 +1238,7 @@ def encode_png_frame(
         str(target),
     ]
     input_args = raw_input_args(frame_width, frame_height, 1)
-    returncode, stderr = run_ffmpeg_raw(input_args, frame_dir, 1, output_args)
+    returncode, stderr = run_ffmpeg_raw(input_args, frame_dir, start_frame + 1, output_args, start_frame)
     if returncode != 0:
         raise RuntimeError("ffmpeg png encode failed: " + stderr.strip())
     if not target.exists() or target.stat().st_size == 0:
@@ -1083,13 +1292,14 @@ def detect_frame_crop(
     padding: int,
     alpha: bool,
     opaque_threshold: int,
+    start_frame: int = 0,
 ) -> VideoCrop | None:
     if not alpha:
-        return detect_opaque_frame_crop(frame_dir, frame_count, width, height, padding, opaque_threshold)
+        return detect_opaque_frame_crop(frame_dir, frame_count, width, height, padding, opaque_threshold, start_frame)
     sample = min(180, frame_count)
     input_args = raw_input_args(width, height, 30)
     output_args = ["-vf", "vflip," + cropdetect_filter(alpha), "-frames:v", str(sample), "-f", "null", "-"]
-    returncode, stderr = run_ffmpeg_raw(input_args, frame_dir, sample, output_args)
+    returncode, stderr = run_ffmpeg_raw(input_args, frame_dir, start_frame + sample, output_args, start_frame)
     if returncode != 0:
         raise RuntimeError("ffmpeg frame crop detection failed: " + stderr.strip())
     return detect_crop_from_output(width, height, stderr, padding)
@@ -1139,13 +1349,14 @@ def detect_opaque_frame_crop(
     height: int,
     padding: int,
     threshold: int,
+    start_frame: int = 0,
 ) -> VideoCrop | None:
     similarity = max(0.0, min(1.0, max(0, int(threshold)) / 255.0))
     sample = min(180, frame_count)
     input_args = raw_input_args(width, height, 30)
     filters = f"vflip,colorkey=0x0f121d:similarity={similarity:.4f}:blend=0,format=rgba,alphaextract,cropdetect=limit=1:round=2:reset=0:skip=0"
     output_args = ["-vf", filters, "-frames:v", str(sample), "-f", "null", "-"]
-    returncode, stderr = run_ffmpeg_raw(input_args, frame_dir, sample, output_args)
+    returncode, stderr = run_ffmpeg_raw(input_args, frame_dir, start_frame + sample, output_args, start_frame)
     if returncode != 0:
         raise RuntimeError("ffmpeg opaque frame crop detection failed: " + stderr.strip())
     return detect_crop_from_output(width, height, stderr, padding)

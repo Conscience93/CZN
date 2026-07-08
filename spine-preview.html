@@ -521,7 +521,8 @@
       lastAtlas: "",
       catalog: [],
       groups: [],
-      charNames: new Map()
+      charNames: new Map(),
+      liveeventLayers: []
     };
 
     document.addEventListener("DOMContentLoaded", () => {
@@ -623,7 +624,11 @@
         height: Number(job.height || 0),
         fps: Number(job.fps || 30),
         duration: Number(job.duration || 1),
-        transparent: job.transparent !== false && job.transparent !== "0"
+        transparent: job.transparent !== false && job.transparent !== "0",
+        layers: Array.isArray(job.layers) ? job.layers : [],
+        stageFrame: (job.stage_frame && Number.isFinite(job.stage_frame.width) && Number.isFinite(job.stage_frame.height))
+          ? job.stage_frame
+          : null
       };
       state.transparent = state.exportSettings.transparent;
       if (job.scale && isValidRenderScale(String(job.scale))) {
@@ -1009,13 +1014,24 @@
         disableAnimationMix(entry);
         applyAnimationPose(player, 0);
         applyAnimationPose(player, LIVEEVENT_STABLE_OFFSET_SECONDS);
+        const width = state.exportSettings.width;
+        const height = state.exportSettings.height;
         const offset = new spine.Vector2();
         const size = new spine.Vector2();
         skeleton.getBounds(offset, size);
         if (size.x > 0 && size.y > 0) {
-          const rect = { x: offset.x, y: offset.y, width: size.x, height: size.y };
-          const width = state.exportSettings.width;
-          const height = state.exportSettings.height;
+          let rect = { x: offset.x, y: offset.y, width: size.x, height: size.y };
+          const stageFrame = state.exportSettings.stageFrame;
+          if (stageFrame) {
+            // Companion bg_b/bg_f/eff layers share this skeleton's coordinate
+            // space and were sized against this stage rect (see
+            // compute_dimensions, Python side). Union rather than replace the
+            // measured character bounds with it: the "lobby" pose can extend
+            // well past the background's own declared frame (e.g. arms/held
+            // props spread wide), and using the stage rect alone would silently
+            // crop the character to fit it.
+            rect = unionRect(rect, { x: stageFrame.x, y: stageFrame.y, width: stageFrame.width, height: stageFrame.height });
+          }
           return width > 0 && height > 0 ? expandRectToAspect(rect, width / height) : rect;
         }
       } catch (_error) {
@@ -1176,6 +1192,14 @@
       return { x: cx - w / 2, y: cy - h / 2, width: w, height: h };
     }
 
+    function unionRect(a, b) {
+      const x0 = Math.min(a.x, b.x);
+      const y0 = Math.min(a.y, b.y);
+      const x1 = Math.max(a.x + a.width, b.x + b.width);
+      const y1 = Math.max(a.y + a.height, b.y + b.height);
+      return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+    }
+
     function intersectRect(a, b) {
       const x0 = Math.max(a.x, b.x);
       const y0 = Math.max(a.y, b.y);
@@ -1226,8 +1250,18 @@
           fullScreenBackgroundColor: state.transparent ? "#00000000" : "#10141dff",
           showControls: !state.exportMode,
           premultipliedAlpha: true,
-          success: function(player) {
+          success: async function(player) {
             state.player = player;
+            if (state.exportMode) {
+              // SpinePlayer.loadSkeleton() calls this.play() near the end of load,
+              // which can land after our own setup runs once loadLiveeventLayersIfNeeded
+              // below awaits real animation frames -- if that flips paused to false
+              // while our own clearPlayerAnimation() has just nulled out track 0,
+              // SpinePlayer's own drawFrame() crashes reading a null current entry.
+              // We drive posing/rendering manually in export mode regardless, so
+              // pin paused=true immediately rather than relying on timing.
+              player.paused = true;
+            }
             const animToPlay = (selectedAnimation && !state.exportMode)
               ? selectedAnimation
               : (player.config && player.config.animation) || animations[0] || null;
@@ -1236,6 +1270,7 @@
             const count = animations.length === 1 ? "1 animation" : animations.length + " animations";
             setStatus("Loaded " + basename(jsonPath) + " with " + count + ".", "ok");
             if (state.exportMode) {
+              await loadLiveeventLayersIfNeeded(player);
               runExportCapture(player, selectedAnimation);
             } else {
               updateQuery();
@@ -1337,16 +1372,78 @@
     // still early enough to land before any dialogue-step pose change.
     const LIVEEVENT_STABLE_OFFSET_SECONDS = 0.15;
 
+    // Draws bg_b layers (back to front by index), then the main character, then
+    // bg_f layers, then eff layers, all via the main player's own sceneRenderer so
+    // everything shares one camera/viewport -- mirrors the exact begin()/
+    // drawSkeleton()/end() sequence SpinePlayer.prototype.drawFrame uses
+    // internally for the main skeleton alone.
+    function drawLiveeventComposite(player) {
+      // The main skeleton is already posed (postStableFrame poses it once, before
+      // reading back the solo frame) -- re-applying the pose here would advance
+      // animationState's internal clock a second time and desync the composite's
+      // pose from the solo frame's.
+      const gl = player.context.gl;
+      // SceneRenderer.begin() doesn't clear the framebuffer (SpinePlayer.drawFrame
+      // does that itself before calling begin()) -- without an explicit clear here,
+      // this composite draw would layer on top of the stale solo-frame pixels
+      // still sitting in the buffer from the read a moment ago.
+      const bg = new spine.Color().setFromString(player.config.backgroundColor);
+      gl.clearColor(bg.r, bg.g, bg.b, bg.a);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      const renderer = player.sceneRenderer;
+      // SpinePlayer.drawFrame() computes camera.zoom/position fresh from
+      // player.currentViewport on every call, then sets zoom back to 0 as its own
+      // very last statement (confirmed in the fetched runtime source) -- so there
+      // is no valid "current" camera state to read or restore after a drawFrame()
+      // call returns. Replicate the same formula directly (same fields drawFrame
+      // itself uses) rather than depending on that transient internal state.
+      const cv = player.currentViewport;
+      const viewport = {
+        x: cv.x - cv.padLeft,
+        y: cv.y - cv.padBottom,
+        width: cv.width + cv.padLeft + cv.padRight,
+        height: cv.height + cv.padBottom + cv.padTop
+      };
+      const viewportSize = player.scale(viewport.width, viewport.height, player.canvas.width, player.canvas.height);
+      renderer.camera.zoom = viewport.width / viewportSize.x;
+      renderer.camera.position.x = viewport.x + viewport.width / 2;
+      renderer.camera.position.y = viewport.y + viewport.height / 2;
+      const premultiplied = player.config.premultipliedAlpha;
+      const byRole = { bg_b: [], bg_f: [], eff: [] };
+      for (const layer of state.liveeventLayers) {
+        if (byRole[layer.role]) byRole[layer.role].push(layer);
+      }
+      for (const role of Object.keys(byRole)) byRole[role].sort((a, b) => a.index - b.index);
+      renderer.begin();
+      for (const layer of byRole.bg_b) renderer.drawSkeleton(layer.skeleton, premultiplied);
+      renderer.drawSkeleton(player.skeleton, premultiplied);
+      for (const layer of byRole.bg_f) renderer.drawSkeleton(layer.skeleton, premultiplied);
+      for (const layer of byRole.eff) renderer.drawSkeleton(layer.skeleton, premultiplied);
+      renderer.end();
+    }
+
     async function postStableFrame(player, canvas, exportId) {
       const gl = getCanvasGl(canvas);
       if (!gl) throw new Error("Could not access the WebGL context for pixel readback.");
+      // Frame 0 is always the character alone (matches every other export group's
+      // single-skeleton render). When companion layers exist, frame 1 is the full
+      // bg_b/character/bg_f/eff composite, saved as a second file so a broken
+      // composite is easy to spot next to the untouched solo shot.
       applyAnimationPose(player, LIVEEVENT_STABLE_OFFSET_SECONDS);
       flushCanvas(canvas);
       const { width, height } = actualCanvasSize(canvas, gl);
-      const pixels = new Uint8Array(width * height * 4);
-      gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-      await postFrame(exportId, 0, pixels);
-      return { frames: 1, width, height };
+      const soloPixels = new Uint8Array(width * height * 4);
+      gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, soloPixels);
+      await postFrame(exportId, 0, soloPixels);
+      if (!state.liveeventLayers.length) {
+        return { frames: 1, width, height };
+      }
+      drawLiveeventComposite(player);
+      flushCanvas(canvas);
+      const compositePixels = new Uint8Array(width * height * 4);
+      gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, compositePixels);
+      await postFrame(exportId, 1, compositePixels);
+      return { frames: 2, width, height };
     }
 
     function getCanvasGl(canvas) {
@@ -1534,6 +1631,64 @@
         };
         requestAnimationFrame(next);
       });
+    }
+
+    function waitForAssetManager(assetManager) {
+      return new Promise((resolve) => {
+        const poll = () => {
+          if (assetManager.isLoadingComplete()) {
+            resolve();
+          } else {
+            requestAnimationFrame(poll);
+          }
+        };
+        poll();
+      });
+    }
+
+    // Liveevent companion layers (bg_b/bg_f/eff) are separate Spine skeletons
+    // sharing the main character's coordinate space. They're loaded with the
+    // low-level spine-webgl runtime (not the SpinePlayer widget, which only
+    // manages one skeleton) so they can be drawn together with the main
+    // character into one shared canvas -- see drawLiveeventComposite().
+    async function loadLiveeventLayer(descriptor, context) {
+      const jsonPath = normalizePath(descriptor.json);
+      const atlasPath = normalizePath(descriptor.atlas || inferAtlasPath(jsonPath));
+      const assetManager = new spine.webgl.AssetManager(context);
+      assetManager.loadText(jsonPath);
+      assetManager.loadTextureAtlas(atlasPath);
+      await waitForAssetManager(assetManager);
+      if (assetManager.hasErrors()) {
+        throw new Error("companion layer load failed: " + JSON.stringify(assetManager.getErrors()));
+      }
+      const atlas = assetManager.get(atlasPath);
+      const jsonText = assetManager.get(jsonPath);
+      const skeletonData = new spine.SkeletonJson(new spine.AtlasAttachmentLoader(atlas)).readSkeletonData(jsonText);
+      const skeleton = new spine.Skeleton(skeletonData);
+      const stateData = new spine.AnimationStateData(skeletonData);
+      const animationState = new spine.AnimationState(stateData);
+      const layerPlayer = { skeleton, animationState };
+      skeleton.setToSetupPose();
+      skeleton.updateWorldTransform();
+      disablePlayerMix(layerPlayer);
+      if (descriptor.animation && skeletonData.findAnimation(descriptor.animation)) {
+        disableAnimationMix(animationState.setAnimation(0, descriptor.animation, false));
+        applyAnimationPose(layerPlayer, 0);
+        applyAnimationPose(layerPlayer, LIVEEVENT_STABLE_OFFSET_SECONDS);
+      }
+      return { role: descriptor.role, index: Number(descriptor.index || 0), skeleton, assetManager };
+    }
+
+    async function loadLiveeventLayersIfNeeded(player) {
+      state.liveeventLayers = [];
+      if (!(state.exportMode && state.exportSettings.group === "liveevent")) return;
+      for (const descriptor of state.exportSettings.layers) {
+        try {
+          state.liveeventLayers.push(await loadLiveeventLayer(descriptor, player.context));
+        } catch (error) {
+          console.warn("liveevent companion layer failed to load; continuing without it", descriptor, error);
+        }
+      }
     }
 
     async function postExportError(message) {
@@ -1724,6 +1879,14 @@
         }
       }
       state.player = null;
+      for (const layer of state.liveeventLayers) {
+        try {
+          layer.assetManager.dispose();
+        } catch (_error) {
+          // best-effort GPU texture cleanup
+        }
+      }
+      state.liveeventLayers = [];
       dom.player.replaceChildren();
     }
 
