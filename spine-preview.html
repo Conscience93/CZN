@@ -979,10 +979,52 @@
       if (currentAssetIsCard()) {
         return setupPoseViewport(player);
       }
+      if (state.exportMode && state.exportSettings.group === "liveevent") {
+        const animName = state.exportSettings.animations[0] || animToPlay;
+        return liveeventPoseViewport(player, animName) || setupPoseViewport(player);
+      }
       const anims = (state.exportMode && state.exportSettings.animations.length)
         ? state.exportSettings.animations
         : (animToPlay ? [animToPlay] : []);
       return unionAnimationViewport(player, anims) || setupPoseViewport(player);
+    }
+
+    // Liveevent stage skeletons declare their own JSON width/height for the whole
+    // scene (a wide room, a panorama, etc.), and unionAnimationViewport sweeps the
+    // bounds across the entire clip's duration — both describe the stage, not the
+    // one character we actually capture. Framing on either leaves the character
+    // tiny in a corner of a mostly-empty canvas, which is the "small/low-res,
+    // wrong aspect" problem. Instead, pose the skeleton at the exact frame
+    // postStableFrame will capture and frame tightly to that single pose, then
+    // expand to the canvas aspect so the fixed capture resolution isn't wasted on
+    // letterbox padding. Liveevent only; model/card/battle framing is untouched.
+    function liveeventPoseViewport(player, animName) {
+      const skeleton = player && player.skeleton;
+      if (!skeleton || !animName || !skeleton.data.findAnimation(animName)) return null;
+      try {
+        disablePlayerMix(player);
+        clearPlayerAnimation(player);
+        setSkeletonSetupPose(player);
+        const entry = player.animationState.setAnimation(0, animName, false);
+        disableAnimationMix(entry);
+        applyAnimationPose(player, 0);
+        applyAnimationPose(player, LIVEEVENT_STABLE_OFFSET_SECONDS);
+        const offset = new spine.Vector2();
+        const size = new spine.Vector2();
+        skeleton.getBounds(offset, size);
+        if (size.x > 0 && size.y > 0) {
+          const rect = { x: offset.x, y: offset.y, width: size.x, height: size.y };
+          const width = state.exportSettings.width;
+          const height = state.exportSettings.height;
+          return width > 0 && height > 0 ? expandRectToAspect(rect, width / height) : rect;
+        }
+      } catch (_error) {
+        // Fall through to the caller's setup-pose fallback.
+      } finally {
+        clearPlayerAnimation(player);
+        setSkeletonSetupPose(player);
+      }
+      return null;
     }
 
     function currentAssetIsCard() {
@@ -1043,7 +1085,7 @@
       const skeleton = player && player.skeleton;
       const gl = getCanvasGl(canvas);
       if (!skeleton || !gl) return;
-      const canvasW = canvas.width, canvasH = canvas.height;
+      const { width: canvasW, height: canvasH } = actualCanvasSize(canvas, gl);
       if (!(canvasW > 0) || !(canvasH > 0) || !animations.length) return;
 
       // Containing rect guaranteed to hold all art (union of setup pose and the
@@ -1239,7 +1281,11 @@
         freezePlayerClock(player);
         playExportAnimations(player, animations, { reset: true });
 
-        const meta = await postDeterministicFrames(player, canvas, duration, fps, settings.id);
+        // Liveevent exports capture a single representative pose rather than a
+        // clip, so there is no frame-count/fps loop to run.
+        const meta = settings.group === "liveevent"
+          ? await postStableFrame(player, canvas, settings.id)
+          : await postDeterministicFrames(player, canvas, duration, fps, settings.id);
 
         const completeResponse = await fetch("/__spine_export__/complete?id=" + encodeURIComponent(settings.id), {
           method: "POST",
@@ -1261,8 +1307,7 @@
       const delta = 1 / fps;
       const gl = getCanvasGl(canvas);
       if (!gl) throw new Error("Could not access the WebGL context for pixel readback.");
-      const width = canvas.width;
-      const height = canvas.height;
+      const { width, height } = actualCanvasSize(canvas, gl);
       // canvas.toBlob("image/png") cost ~1.1s per frame — PNG compression on the
       // main thread was effectively the entire export time. Read the raw RGBA
       // pixels off the GPU instead (a fast memcpy) and let ffmpeg encode them as
@@ -1286,8 +1331,75 @@
       return { frames: frameCount, width, height };
     }
 
+    // A liveevent PNG wants one settled pose, not a clip. Time 0 of 2_step1_play can
+    // still be settling out of whatever pose the setup/previous track left behind,
+    // so nudge a little further into the animation before reading pixels back —
+    // still early enough to land before any dialogue-step pose change.
+    const LIVEEVENT_STABLE_OFFSET_SECONDS = 0.15;
+
+    async function postStableFrame(player, canvas, exportId) {
+      const gl = getCanvasGl(canvas);
+      if (!gl) throw new Error("Could not access the WebGL context for pixel readback.");
+      applyAnimationPose(player, LIVEEVENT_STABLE_OFFSET_SECONDS);
+      flushCanvas(canvas);
+      const { width, height } = actualCanvasSize(canvas, gl);
+      const pixels = new Uint8Array(width * height * 4);
+      gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      await postFrame(exportId, 0, pixels);
+      return { frames: 1, width, height };
+    }
+
     function getCanvasGl(canvas) {
       return canvas.getContext("webgl2") || canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+    }
+
+    // canvas.width/height report whatever we asked for, but the browser silently
+    // shrinks the actual drawing buffer when a request exceeds the GL
+    // implementation's max renderbuffer/viewport size (liveevent captures at 4x
+    // supersampling can ask for 12000-16000px, well past a common 8192 cap on
+    // software/SwiftShader-backed headless Chrome). Reading gl.drawingBufferWidth/
+    // Height instead of canvas.width/height gets the size that was actually
+    // allocated, so the viewport and readPixels stay in sync with reality instead
+    // of rendering into a corner of the requested canvas and leaving the rest
+    // blank (which looked like the image being clipped/squashed).
+    function actualCanvasSize(canvas, gl) {
+      gl = gl || getCanvasGl(canvas);
+      const width = (gl && gl.drawingBufferWidth) || canvas.width;
+      const height = (gl && gl.drawingBufferHeight) || canvas.height;
+      return { width, height };
+    }
+
+    // The browser's own clamp (above) is not safe to rely on for more than
+    // avoiding a crash: when a requested canvas size exceeds the GL
+    // implementation's max texture/renderbuffer/viewport dimension, Chrome
+    // clamps width and height independently rather than by a common factor, so
+    // the allocated buffer can come out a completely different aspect ratio
+    // than requested (observed: a 13080x7480 request came back as 6027x5503 --
+    // 1.75 aspect requested, 1.10 aspect allocated). The scene is posed assuming
+    // the original aspect, so gl.viewport() then stretches it non-uniformly to
+    // fill the wrong-shaped buffer -- this is what "squashed horizontally" was.
+    // Pre-shrinking both dimensions by the same factor keeps the aspect exact
+    // (at a lower supersampling factor than requested) so no such clamp ever
+    // has to kick in.
+    let cachedMaxGlDimension = 0;
+    function maxGlDimension(gl) {
+      if (cachedMaxGlDimension) return cachedMaxGlDimension;
+      const limits = [gl.getParameter(gl.MAX_TEXTURE_SIZE), gl.getParameter(gl.MAX_RENDERBUFFER_SIZE)];
+      const viewportDims = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
+      if (viewportDims) limits.push(viewportDims[0], viewportDims[1]);
+      cachedMaxGlDimension = Math.max(1, Math.min(...limits.filter((value) => value > 0)));
+      return cachedMaxGlDimension;
+    }
+
+    function clampToGlLimit(width, height, gl) {
+      const maxDim = maxGlDimension(gl);
+      const largest = Math.max(width, height);
+      if (largest <= maxDim) return { width, height };
+      const factor = maxDim / largest;
+      return {
+        width: Math.max(1, Math.floor(width * factor)),
+        height: Math.max(1, Math.floor(height * factor))
+      };
     }
 
     async function postFrame(exportId, frame, pixels) {
@@ -1462,8 +1574,9 @@
         const cssWidth = Math.max(1, Math.round(canvas.clientWidth || (parent ? parent.clientWidth : 0) || canvas.width || 1));
         const cssHeight = Math.max(1, Math.round(canvas.clientHeight || (parent ? parent.clientHeight : 0) || canvas.height || 1));
         const renderScale = getRenderScale();
-        const pixelWidth = Math.max(1, Math.round(cssWidth * renderScale));
-        const pixelHeight = Math.max(1, Math.round(cssHeight * renderScale));
+        const requestedWidth = Math.max(1, Math.round(cssWidth * renderScale));
+        const requestedHeight = Math.max(1, Math.round(cssHeight * renderScale));
+        const { width: pixelWidth, height: pixelHeight } = clampToGlLimit(requestedWidth, requestedHeight, this.context.gl);
         updateRenderInfo(cssWidth, cssHeight, pixelWidth, pixelHeight, renderScale);
 
         if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
@@ -1473,7 +1586,8 @@
         canvas.style.width = cssWidth + "px";
         canvas.style.height = cssHeight + "px";
 
-        this.context.gl.viewport(0, 0, canvas.width, canvas.height);
+        const actual = actualCanvasSize(canvas, this.context.gl);
+        this.context.gl.viewport(0, 0, actual.width, actual.height);
 
         if (resizeMode === spine.webgl.ResizeMode.Expand) {
           this.camera.setViewport(cssWidth, cssHeight);

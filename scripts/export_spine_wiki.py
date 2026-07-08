@@ -195,7 +195,7 @@ class ExportServer(http.server.ThreadingHTTPServer):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--character", action="append", help="Playable character ID or slug/name. May be passed more than once.")
-    parser.add_argument("--type", default="all", help="Comma-separated export groups: all, battle_ready, model, card.")
+    parser.add_argument("--type", default="all", help="Comma-separated export groups: all, battle_ready, model, card, liveevent.")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--output-scale", type=float, default=2.0, help="Scale intrinsic skeleton bounds to output dimensions.")
     parser.add_argument("--render-scale", choices=("1", "2", "3", "4"), default="1", help="Browser backing-canvas supersampling before ffmpeg downsampling. 1 disables supersampling (fastest).")
@@ -206,16 +206,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--padding", type=float, default=24.0, help="Padding in skeleton coordinate units before output scaling.")
     parser.add_argument("--battle-crop-padding", type=int, default=16, help="Pixel padding to keep around detected battle_ready content after cropping.")
     parser.add_argument("--card-crop-padding", type=int, default=0, help="Pixel padding to keep around detected card content after cropping. Cards are transparent, so 0 keeps the art flush with no border.")
+    parser.add_argument("--liveevent-crop-padding", type=int, default=32, help="Pixel padding to keep around detected liveevent content after cropping.")
     parser.add_argument("--battle-transparent", action="store_true", help="Keep battle_ready exports transparent. By default they use the preview's dark background to avoid additive-effect alpha artifacts.")
     parser.add_argument("--opaque-crop-threshold", type=int, default=8, help="RGB distance from the preview background required for opaque crop detection.")
     parser.add_argument("--no-battle-crop", action="store_true", help="Disable post-capture black border cropping for battle_ready exports.")
     parser.add_argument("--no-card-crop", action="store_true", help="Disable post-capture black border cropping for card exports.")
+    parser.add_argument("--no-liveevent-crop", action="store_true", help="Disable post-capture transparent-margin cropping for liveevent exports.")
     parser.add_argument("--no-card-trim", action="store_true", help="Keep the zoom-in lead-in frames of card animations instead of starting playback at the settled card.")
     parser.add_argument("--max-edge", type=int, default=0, help="Optional maximum output width/height.")
     parser.add_argument("--card-max-edge", type=int, default=4096, help="Optional maximum card capture width/height before cropping.")
+    parser.add_argument("--liveevent-max-edge", type=int, default=4096, help="Optional maximum liveevent capture width/height before cropping. Liveevent stage skeletons can be huge (e.g. panoramic scenes) and liveevent always renders at 4x, so an uncapped outlier can exceed the browser's array-buffer/texture limits.")
     parser.add_argument("--duration-pad", type=float, default=0.25)
     parser.add_argument("--capture-timeout", type=float, default=360.0)
     parser.add_argument("--force-swiftshader", action="store_true", help="Force Chrome's software WebGL renderer. Off by default so hardware GPU can be used.")
+    parser.add_argument("--chrome-restart-interval", type=int, default=8, help="Restart the persistent Chrome after this many jobs to avoid WebGL context/GPU memory exhaustion during large batches. 0 disables periodic restarts.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--keep-temp", action="store_true")
     parser.add_argument("--spine-runtime-url", action="append", help="Spine Player JS URL or local path. May be passed more than once.")
@@ -285,11 +289,19 @@ def main() -> int:
     return 1 if manifest["errors"] else 0
 
 
+EXPORT_GROUPS = {"battle_ready", "model", "card", "liveevent"}
+
+# The starting frames of 2_step1_play are the most stable representative pose for a
+# liveevent sequence: later frames cycle through dialogue steps and expressions, but
+# early frames settle into the resting pose the sequence opens on.
+LIVEEVENT_ANIMATION = "2_step1_play"
+
+
 def parse_groups(raw: str) -> set[str]:
     groups = {part.strip().lower() for part in raw.split(",") if part.strip()}
     if not groups or "all" in groups:
-        return {"battle_ready", "model", "card"}
-    invalid = groups - {"battle_ready", "model", "card"}
+        return set(EXPORT_GROUPS)
+    invalid = groups - EXPORT_GROUPS
     if invalid:
         raise SystemExit(f"Unsupported type(s): {', '.join(sorted(invalid))}")
     return groups
@@ -366,6 +378,17 @@ def build_jobs(characters: list[Character], groups: set[str], args: argparse.Nam
                     animations,
                     args,
                 )
+        if "liveevent" in groups:
+            add_job(
+                jobs,
+                skipped,
+                char,
+                "liveevent",
+                MODEL_DIR / f"liveevent_{char.id}.json",
+                "liveevent",
+                (LIVEEVENT_ANIMATION,),
+                args,
+            )
         if "card" in groups:
             card_jsons = sorted(CARD_DIR.glob(f"unique_{char.id}_*.json"))
             for source_json in card_jsons:
@@ -415,7 +438,12 @@ def add_job(
         skipped.append(skip_payload(char, group, source_json, "missing intrinsic skeleton width/height"))
         return
     output_scale = group_output_scale(group, args)
-    max_edge = args.card_max_edge if group == "card" else args.max_edge
+    if group == "card":
+        max_edge = args.card_max_edge
+    elif group == "liveevent":
+        max_edge = args.liveevent_max_edge
+    else:
+        max_edge = args.max_edge
     final_width, final_height = compute_dimensions(intrinsic_width, intrinsic_height, output_scale, args.padding, max_edge)
     capture_width = final_width
     capture_height = final_height
@@ -498,9 +526,9 @@ def iter_times(value: Any) -> list[float]:
 
 def print_dry_run(jobs: list[ExportJob], skipped: list[dict[str, Any]], args: argparse.Namespace) -> None:
     print(f"Planned jobs: {len(jobs)}")
-    print("Format: webm")
-    scale = render_scale(args)
+    print("Format: webm, liveevent: png")
     for job in jobs:
+        scale = job_render_scale(job, args)
         capture_width, capture_height = actual_capture_dimensions(job, scale)
         print(
             f"{job.key}: {rel(job.source_json)} "
@@ -566,11 +594,13 @@ def run_jobs(
     the export wall time. Here Chrome loads the controller page once and pulls each
     job from /__spine_export__/next, keeping the runtime and GL context warm; Python
     encodes each job's frames as the browser moves on to the next, overlapping the
-    two stages.
+    two stages. The Chrome process is recycled every --chrome-restart-interval jobs
+    (and immediately on a WebGL context error) since a single GL context slowly
+    exhausts GPU resources over a large batch.
     """
     plans: list[tuple[ExportJob, str, Path, Path]] = []
     for index, job in enumerate(jobs, start=1):
-        target = job.output_dir / f"{job.output_stem}.webm"
+        target = job.output_dir / f"{job.output_stem}{output_extension(job)}"
         if target.exists() and not args.overwrite:
             manifest["skipped"].append({
                 "skipped": True,
@@ -584,20 +614,41 @@ def run_jobs(
         frame_dir = tmp_dir / f"{capture_id}-frames"
         frame_dir.mkdir(parents=True)
         server.frame_dirs[capture_id] = frame_dir
-        server.jobs.put(job_descriptor(capture_id, job, args))
+        server.jobs.put(job_descriptor(capture_id, job, args, job_render_scale(job, args)))
         plans.append((job, capture_id, frame_dir, target))
 
     if not plans:
         return
 
-    scale = render_scale(args)
     url = build_controller_url(base_url, runtime_urls(args))
     chrome = launch_chrome(args, url, tmp_dir / "chrome-controller")
+    jobs_since_restart = 0
+    restart_interval = max(0, int(args.chrome_restart_interval))
     try:
         total = len(plans)
         for index, (job, capture_id, frame_dir, target) in enumerate(plans, start=1):
             print(f"[{index}/{total}] {job.key}", flush=True)
+            # A single long-lived Chrome/WebGL context slowly exhausts GPU resources
+            # over a large batch (observed failing with "does not support WebGL"
+            # after roughly a dozen large liveevent captures). Recycling the process
+            # periodically keeps each context's lifetime bounded.
+            if restart_interval and jobs_since_restart >= restart_interval:
+                terminate_process(chrome)
+                chrome = launch_chrome(args, url, tmp_dir / f"chrome-controller-{index}")
+                jobs_since_restart = 0
+            scale = job_render_scale(job, args)
             result = finalize_capture(job, capture_id, frame_dir, target, args, server, scale, chrome)
+            jobs_since_restart += 1
+            if not result.get("ok") and is_webgl_context_error(result.get("message")):
+                print("  WebGL context error; restarting Chrome and retrying once...", flush=True)
+                terminate_process(chrome)
+                chrome = launch_chrome(args, url, tmp_dir / f"chrome-controller-retry-{index}")
+                jobs_since_restart = 0
+                shutil.rmtree(frame_dir, ignore_errors=True)
+                frame_dir.mkdir(parents=True)
+                server.jobs.put(job_descriptor(capture_id, job, args, scale))
+                result = finalize_capture(job, capture_id, frame_dir, target, args, server, scale, chrome)
+                jobs_since_restart += 1
             if result.get("ok"):
                 manifest["jobs"].append(result)
             else:
@@ -638,6 +689,9 @@ def finalize_capture(
         frame_height = int(capture_result.get("height") or 0)
         if frame_width <= 0 or frame_height <= 0:
             raise RuntimeError("browser did not report frame dimensions")
+
+        if job.group == "liveevent":
+            return finalize_png_capture(job, frame_dir, target, frame_width, frame_height, args, scale, alpha)
 
         crop = None
         target_width = job.final_width
@@ -695,6 +749,58 @@ def finalize_capture(
         return error_payload(job, str(exc))
 
 
+def finalize_png_capture(
+    job: ExportJob,
+    frame_dir: Path,
+    target: Path,
+    frame_width: int,
+    frame_height: int,
+    args: argparse.Namespace,
+    scale: int,
+    alpha: bool,
+) -> dict[str, Any]:
+    try:
+        crop = None
+        target_width = job.final_width
+        target_height = job.final_height
+        if should_crop_job(job, args):
+            crop = detect_frame_crop(
+                frame_dir,
+                1,
+                frame_width,
+                frame_height,
+                scaled_crop_padding(job, args, scale),
+                alpha,
+                args.opaque_crop_threshold,
+            )
+            if crop is not None:
+                target_width, target_height = scaled_crop_dimensions(crop, scale)
+
+        encode_png_frame(frame_dir, target, frame_width, frame_height, target_width, target_height, crop, alpha)
+        output_width, output_height = video_dimensions(target)
+        return {
+            "ok": True,
+            "key": job.key,
+            "character_id": job.character.id,
+            "character": job.character.name,
+            "group": job.group,
+            "source_json": rel(job.source_json),
+            "source_atlas": rel(job.source_atlas),
+            "animations": list(job.animations),
+            "intrinsic_dimensions": [job.intrinsic_width, job.intrinsic_height],
+            "dimensions": [output_width, output_height],
+            "planned_dimensions": [job.final_width, job.final_height],
+            "capture_dimensions": [frame_width, frame_height],
+            "render_scale": scale,
+            "capture_mode": "single_frame_png",
+            "crop": dataclasses.asdict(crop) if crop else None,
+            "frame_count": 1,
+            "output": rel(target),
+        }
+    except Exception as exc:  # noqa: BLE001 - manifest should record all job failures.
+        return error_payload(job, str(exc))
+
+
 def runtime_urls(args: argparse.Namespace) -> list[str]:
     if not args.spine_runtime_url:
         return DEFAULT_RUNTIME_URLS
@@ -717,7 +823,7 @@ def build_controller_url(base_url: str, runtime_url_list: list[str]) -> str:
     return base_url + "/spine-preview.html?" + urllib.parse.urlencode(params)
 
 
-def job_descriptor(capture_id: str, job: ExportJob, args: argparse.Namespace) -> dict[str, Any]:
+def job_descriptor(capture_id: str, job: ExportJob, args: argparse.Namespace, scale: int) -> dict[str, Any]:
     return {
         "id": capture_id,
         "group": job.group,
@@ -729,7 +835,7 @@ def job_descriptor(capture_id: str, job: ExportJob, args: argparse.Namespace) ->
         "height": job.capture_height,
         "fps": args.fps,
         "duration": round(job.duration_seconds, 4),
-        "scale": str(render_scale(args)),
+        "scale": str(scale),
         "transparent": job_uses_alpha(job, args),
     }
 
@@ -772,6 +878,18 @@ def render_scale(args: argparse.Namespace) -> int:
     return int(args.render_scale)
 
 
+def job_render_scale(job: ExportJob, args: argparse.Namespace) -> int:
+    """Liveevent PNGs are a single still frame, so there's no per-frame speed cost to
+    amortize; always supersample at 4x for the sharpest possible downsample."""
+    if job.group == "liveevent":
+        return 4
+    return render_scale(args)
+
+
+def output_extension(job: ExportJob) -> str:
+    return ".png" if job.group == "liveevent" else ".webm"
+
+
 def actual_capture_dimensions(job: ExportJob, scale: int) -> tuple[int, int]:
     return job.capture_width * scale, job.capture_height * scale
 
@@ -781,6 +899,8 @@ def should_crop_job(job: ExportJob, args: argparse.Namespace) -> bool:
         return not args.no_battle_crop
     if job.group == "card":
         return not args.no_card_crop
+    if job.group == "liveevent":
+        return not args.no_liveevent_crop
     return False
 
 
@@ -789,7 +909,12 @@ def job_uses_alpha(job: ExportJob, args: argparse.Namespace) -> bool:
 
 
 def scaled_crop_padding(job: ExportJob, args: argparse.Namespace, scale: int) -> int:
-    padding = args.battle_crop_padding if job.group == "battle_ready" else args.card_crop_padding
+    if job.group == "battle_ready":
+        padding = args.battle_crop_padding
+    elif job.group == "liveevent":
+        padding = args.liveevent_crop_padding
+    else:
+        padding = args.card_crop_padding
     return int(round(padding * scale))
 
 
@@ -881,6 +1006,36 @@ def encode_frames(
         raise RuntimeError("ffmpeg frame encode produced an empty file")
 
 
+def encode_png_frame(
+    frame_dir: Path,
+    target: Path,
+    frame_width: int,
+    frame_height: int,
+    width: int,
+    height: int,
+    crop: VideoCrop | None,
+    alpha: bool,
+) -> None:
+    filters = encode_filters(width, height, crop, None, alpha)
+    output_args = [
+        "-vf",
+        filters,
+        "-frames:v",
+        "1",
+        "-update",
+        "1",
+        "-pix_fmt",
+        "rgba" if alpha else "rgb24",
+        str(target),
+    ]
+    input_args = raw_input_args(frame_width, frame_height, 1)
+    returncode, stderr = run_ffmpeg_raw(input_args, frame_dir, 1, output_args)
+    if returncode != 0:
+        raise RuntimeError("ffmpeg png encode failed: " + stderr.strip())
+    if not target.exists() or target.stat().st_size == 0:
+        raise RuntimeError("ffmpeg png encode produced an empty file")
+
+
 def encode_filters(
     width: int, height: int, crop: VideoCrop | None = None, fps: int | None = None, alpha: bool = True
 ) -> str:
@@ -891,6 +1046,13 @@ def encode_filters(
     if fps is not None:
         filters.append(f"fps={max(1, int(fps))}")
     filters.append(f"scale={width}:{height}:flags=lanczos")
+    # rawvideo has no SAR, so it defaults to the unknown/degenerate 0:1 sentinel.
+    # The VP9 muxer normalizes this to 1:1 on its own, but the PNG encoder writes
+    # it verbatim into a pHYs chunk (x_res=0, y_res=1) -- some image viewers read
+    # that as "non-square pixels" and rescale the displayed image accordingly,
+    # which looks exactly like the pixel data itself being horizontally squashed
+    # even though it isn't. Force square pixels explicitly for both output types.
+    filters.append("setsar=1")
     # Spine renders premultiplied; scale in that space (clean edges) then convert
     # back to straight alpha for the yuva420p webm. Without this, semi-transparent
     # pixels (e.g. blush) keep their premultiplied RGB and show wrong colors.
@@ -981,7 +1143,7 @@ def detect_opaque_frame_crop(
     similarity = max(0.0, min(1.0, max(0, int(threshold)) / 255.0))
     sample = min(180, frame_count)
     input_args = raw_input_args(width, height, 30)
-    filters = f"vflip,colorkey=0x0f121d:similarity={similarity:.4f}:blend=0,format=rgba,alphaextract,cropdetect=limit=1:round=2:reset=0"
+    filters = f"vflip,colorkey=0x0f121d:similarity={similarity:.4f}:blend=0,format=rgba,alphaextract,cropdetect=limit=1:round=2:reset=0:skip=0"
     output_args = ["-vf", filters, "-frames:v", str(sample), "-f", "null", "-"]
     returncode, stderr = run_ffmpeg_raw(input_args, frame_dir, sample, output_args)
     if returncode != 0:
@@ -990,9 +1152,11 @@ def detect_opaque_frame_crop(
 
 
 def cropdetect_filter(alpha: bool) -> str:
+    # skip=0 disables cropdetect's default "skip the first 2 frames" behavior, which
+    # would silently produce zero crop evaluations for a single-frame PNG capture.
     if alpha:
-        return "format=rgba,alphaextract,cropdetect=limit=1:round=2:reset=0"
-    return "cropdetect=limit=40:round=2:reset=0"
+        return "format=rgba,alphaextract,cropdetect=limit=1:round=2:reset=0:skip=0"
+    return "cropdetect=limit=40:round=2:reset=0:skip=0"
 
 
 def detect_crop_from_output(width: int, height: int, output: str, padding: int) -> VideoCrop | None:
@@ -1148,6 +1312,10 @@ def error_payload(job: ExportJob, message: str) -> dict[str, Any]:
         "animations": list(job.animations),
         "message": message,
     }
+
+
+def is_webgl_context_error(message: str | None) -> bool:
+    return bool(message) and "does not support WebGL" in message
 
 
 def terminate_process(process: subprocess.Popen[bytes]) -> None:
