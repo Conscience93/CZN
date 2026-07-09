@@ -20,6 +20,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -127,7 +128,13 @@ class ExportResultHandler(http.server.SimpleHTTPRequestHandler):
             try:
                 job = self.server.jobs.get_nowait()
             except queue.Empty:
-                job = {"done": True}
+                # An empty queue can mean two different things: the whole export is
+                # finished (all_dispatched), or we're between chunks waiting for the
+                # current Chrome generation to be retired before the next chunk is
+                # enqueued (see run_jobs). Only the former should stop the browser's
+                # poll loop -- the latter must ask it to retry shortly, or the browser
+                # would quit thinking the export is done while jobs remain.
+                job = {"done": True} if self.server.all_dispatched else {"wait": True}
             self._send_json(job)
             return
         super().do_GET()
@@ -212,6 +219,19 @@ class ExportServer(http.server.ThreadingHTTPServer):
         self.results: queue.Queue[dict[str, Any]] = queue.Queue()
         self.jobs: queue.Queue[dict[str, Any]] = queue.Queue()
         self.verbose = verbose
+        self.all_dispatched = False
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # Periodic Chrome restarts (--chrome-restart-interval) terminate the browser
+        # while it may still hold a connection open (e.g. the long-poll GET for the
+        # next job), which surfaces here as a routine connection reset/broken pipe.
+        # That's expected, not a bug, so don't spam a traceback for it.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+            if self.verbose:
+                print(f"  (ignoring connection reset from {client_address}, likely a recycled Chrome process)", flush=True)
+            return
+        super().handle_error(request, client_address)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -330,6 +350,12 @@ LIVEEVENT_LAYER_SUFFIX_RE = re.compile(r"^(bg_b|bg_f|eff|intro)_(\d+)$")
 # excluded from the composite by default; --liveevent-render-roles can override this.
 LIVEEVENT_DEFAULT_RENDER_ROLES = frozenset({"bg_b", "bg_f", "eff"})
 LIVEEVENT_ROLE_DRAW_ORDER = {"bg_b": 0, "bg_f": 2, "eff": 3}  # main character implicitly sits at 1
+# Within a role, higher-numbered layers sit farther from the camera and draw first:
+# every liveevent_data/{id}.le sampled lists depth_infos front-to-back as
+# [fade, bg_f_01, bg_f_02, ..., character, bg_b_01, bg_b_02, ...] (fade nearest,
+# since it's a screen-covering transition; ascending bg_f/bg_b index moving away
+# from the character in both directions). Sorting by descending index within each
+# role reproduces that back-to-front draw order.
 
 
 def parse_groups(raw: str) -> set[str]:
@@ -419,6 +445,117 @@ def discover_liveevent_layers(char: Character) -> list[LiveeventLayer]:
     return layers
 
 
+def _bone_local_matrix(bone: dict[str, Any]) -> tuple[float, float, float, float]:
+    """Return the bone's own (a, b, c, d) rotation/scale/shear matrix (no translation)."""
+    rotation = float(bone.get("rotation") or 0.0)
+    scale_x = float(bone["scaleX"]) if bone.get("scaleX") is not None else 1.0
+    scale_y = float(bone["scaleY"]) if bone.get("scaleY") is not None else 1.0
+    shear_x = float(bone.get("shearX") or 0.0)
+    shear_y = float(bone.get("shearY") or 0.0)
+    rad_x = math.radians(rotation + shear_x)
+    rad_y = math.radians(rotation + shear_y + 90.0)
+    a = math.cos(rad_x) * scale_x
+    c = math.sin(rad_x) * scale_x
+    b = math.cos(rad_y) * scale_y
+    d = math.sin(rad_y) * scale_y
+    return a, b, c, d
+
+
+def bone_world_transforms(bones_data: list[dict[str, Any]]) -> dict[str, tuple[float, float, float, float, float, float]]:
+    """Map bone name -> (a, b, c, d, worldX, worldY) affine transform, such that a local
+    point (lx, ly) in that bone's space maps to world space as
+    (a*lx + b*ly + worldX, c*lx + d*ly + worldY).
+
+    Composes translation/rotation/scale/shear down the parent chain the same way
+    Spine's runtime does for the default "normal" inherit mode -- the only mode
+    observed on this project's liveevent stage skeletons.
+    """
+    by_name = {bone["name"]: bone for bone in bones_data}
+    world: dict[str, tuple[float, float, float, float, float, float]] = {}
+
+    def resolve(name: str) -> tuple[float, float, float, float, float, float]:
+        if name in world:
+            return world[name]
+        bone = by_name[name]
+        la, lb, lc, ld = _bone_local_matrix(bone)
+        lx = float(bone.get("x") or 0.0)
+        ly = float(bone.get("y") or 0.0)
+        parent_name = bone.get("parent")
+        if parent_name is None:
+            result = (la, lb, lc, ld, lx, ly)
+        else:
+            pa, pb, pc, pd, px, py = resolve(parent_name)
+            result = (
+                pa * la + pb * lc,
+                pa * lb + pb * ld,
+                pc * la + pd * lc,
+                pc * lb + pd * ld,
+                pa * lx + pb * ly + px,
+                pc * lx + pd * ly + py,
+            )
+        world[name] = result
+        return result
+
+    for bone in bones_data:
+        resolve(bone["name"])
+    return world
+
+
+def stage_clip_bounds(stage_data: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    """Return (x, y, width, height) of the stage's clipping mask, in world-space.
+
+    Every liveevent stage layer sampled (bg_b_01 across many characters) carries a
+    clipping attachment -- usually named "1580X720_guide" -- whose vertices are
+    reliably centered on the origin (e.g. x in [-790, 790], y in [-360, 360]) once
+    converted to world space. The JSON's own top-level "skeleton" header
+    (x/y/width/height) is not: it was observed to always declare x=0, y=0 regardless
+    of character, which silently shifts the liveevent camera by roughly half the
+    stage size and crops out whichever half of the background doesn't happen to be
+    near the character. The clip polygon is the one source of truth for where the
+    stage actually sits, so measure it directly instead of trusting the header.
+
+    The clip's vertices are stored in the local space of whichever bone its slot is
+    attached to, not world space. Most characters' clip bone is the root (or a
+    zero-offset, unscaled camera bone), so raw vertices happen to equal world
+    coordinates -- but at least one character (Diana, 1061) parents its clip under a
+    bone with scaleX/scaleY = 0.28, which without this conversion inflates the
+    computed stage frame ~3.6x and makes the final export render at a much lower
+    resolution after the max-edge clamp kicks in. Applying the bone's full world
+    transform fixes that case and is a no-op for the common case.
+    """
+    bones_data = stage_data.get("bones") or []
+    transforms = bone_world_transforms(bones_data)
+    slot_bones = {slot["name"]: slot.get("bone") for slot in stage_data.get("slots") or []}
+
+    skins = stage_data.get("skins")
+    # Spine 3.8's skin JSON has two shapes across versions: a list of
+    # {"name", "attachments"} entries (what every asset here actually uses) or a bare
+    # {skin_name: {slot: {attachment: {...}}}} dict (older format, kept as a fallback).
+    if isinstance(skins, dict):
+        attachments_list = list(skins.values())
+    else:
+        attachments_list = [entry.get("attachments", {}) for entry in skins or []]
+    for attachments in attachments_list:
+        for slot_name, slot_attachments in attachments.items():
+            for attachment in slot_attachments.values():
+                if attachment.get("type") != "clipping":
+                    continue
+                vertices = attachment.get("vertices") or []
+                xs_local = vertices[0::2]
+                ys_local = vertices[1::2]
+                if not xs_local or not ys_local:
+                    continue
+                matrix = transforms.get(slot_bones.get(slot_name))
+                if matrix is not None:
+                    a, b, c, d, tx, ty = matrix
+                    xs = [a * lx + b * ly + tx for lx, ly in zip(xs_local, ys_local)]
+                    ys = [c * lx + d * ly + ty for lx, ly in zip(xs_local, ys_local)]
+                else:
+                    xs, ys = xs_local, ys_local
+                return (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+    return None
+
+
 def canonical_stage_layer(layers: list[LiveeventLayer]) -> LiveeventLayer | None:
     def best(role: str) -> LiveeventLayer | None:
         candidates = sorted(
@@ -452,7 +589,7 @@ def resolve_liveevent_layer_animations(
                 rendered=layer.role in render_roles,
             )
         )
-    resolved.sort(key=lambda layer: (LIVEEVENT_ROLE_DRAW_ORDER.get(layer.role, 99), layer.index if layer.index is not None else 0))
+    resolved.sort(key=lambda layer: (LIVEEVENT_ROLE_DRAW_ORDER.get(layer.role, 99), -(layer.index if layer.index is not None else 0)))
     return resolved
 
 
@@ -491,16 +628,18 @@ def build_jobs(characters: list[Character], groups: set[str], args: argparse.Nam
             frame_override = None
             if stage_layer is not None:
                 stage_data = load_json(stage_layer.source_json)
-                stage_skeleton = stage_data.get("skeleton", {})
-                stage_width = float(stage_skeleton.get("width") or 0)
-                stage_height = float(stage_skeleton.get("height") or 0)
-                if stage_width > 0 and stage_height > 0:
-                    frame_override = (
-                        float(stage_skeleton.get("x") or 0),
-                        float(stage_skeleton.get("y") or 0),
-                        stage_width,
-                        stage_height,
-                    )
+                frame_override = stage_clip_bounds(stage_data)
+                if frame_override is None:
+                    stage_skeleton = stage_data.get("skeleton", {})
+                    stage_width = float(stage_skeleton.get("width") or 0)
+                    stage_height = float(stage_skeleton.get("height") or 0)
+                    if stage_width > 0 and stage_height > 0:
+                        frame_override = (
+                            float(stage_skeleton.get("x") or 0),
+                            float(stage_skeleton.get("y") or 0),
+                            stage_width,
+                            stage_height,
+                        )
             add_job(
                 jobs,
                 skipped,
@@ -589,8 +728,8 @@ def add_job(
             character=char,
             source_json=source_json,
             source_atlas=source_atlas,
-            output_dir=L2D_ROOT / group / f"{char.id}-{char.slug}",
-            output_stem=safe_stem(output_stem),
+            output_dir=L2D_ROOT / group,
+            output_stem=safe_stem(f"{char.slug}-{output_stem}"),
             animations=animations,
             intrinsic_width=intrinsic_width,
             intrinsic_height=intrinsic_height,
@@ -728,16 +867,25 @@ def run_jobs(
     tmp_dir: Path,
     manifest: dict[str, Any],
 ) -> None:
-    """Render every job in a single long-lived Chrome that pulls work from a queue.
+    """Render every job in a long-lived Chrome that pulls work from a queue.
 
     Chrome cold-starts a process, initialises the GPU, and re-fetches the Spine
     runtime from the CDN on every launch, so launching it once per job dominated
     the export wall time. Here Chrome loads the controller page once and pulls each
     job from /__spine_export__/next, keeping the runtime and GL context warm; Python
     encodes each job's frames as the browser moves on to the next, overlapping the
-    two stages. The Chrome process is recycled every --chrome-restart-interval jobs
-    (and immediately on a WebGL context error) since a single GL context slowly
-    exhausts GPU resources over a large batch.
+    two stages. The browser's next-job fetch runs as soon as it POSTs /complete for
+    the previous one -- entirely independent of Python's main loop -- so jobs are
+    only ever enqueued in chunks of --chrome-restart-interval: enqueueing the next
+    chunk (and launching its Chrome) only happens after the current chunk's Chrome
+    has been fully retired, so the browser can never dequeue a job that's about to
+    be lost to a restart. (An earlier version enqueued every job upfront and
+    restarted based on a completed-job counter; the browser would sometimes already
+    have dequeued the next job by the time Python decided to restart, silently
+    dropping that job and hanging forever waiting for a result that would never
+    arrive.) The Chrome process is also recycled immediately on a WebGL context
+    error, since a single GL context slowly exhausts GPU resources over a large
+    batch.
     """
     plans: list[tuple[ExportJob, str, Path, Path]] = []
     for index, job in enumerate(jobs, start=1):
@@ -755,51 +903,57 @@ def run_jobs(
         frame_dir = tmp_dir / f"{capture_id}-frames"
         frame_dir.mkdir(parents=True)
         server.frame_dirs[capture_id] = frame_dir
-        server.jobs.put(job_descriptor(capture_id, job, args, job_render_scale(job, args)))
         plans.append((job, capture_id, frame_dir, target))
 
     if not plans:
         return
 
     url = build_controller_url(base_url, runtime_urls(args))
-    chrome = launch_chrome(args, url, tmp_dir / "chrome-controller")
-    jobs_since_restart = 0
     restart_interval = max(0, int(args.chrome_restart_interval))
+    chunk_size = restart_interval if restart_interval else len(plans)
+    total = len(plans)
+    chrome: subprocess.Popen[bytes] | None = None
     try:
-        total = len(plans)
-        for index, (job, capture_id, frame_dir, target) in enumerate(plans, start=1):
-            print(f"[{index}/{total}] {job.key}", flush=True)
+        chunk_start = 0
+        while chunk_start < total:
+            chunk_end = min(chunk_start + chunk_size, total)
+            chunk = plans[chunk_start:chunk_end]
+            server.all_dispatched = chunk_end >= total
+            for job, capture_id, frame_dir, target in chunk:
+                server.jobs.put(job_descriptor(capture_id, job, args, job_render_scale(job, args)))
+
+            chrome = launch_chrome(args, url, tmp_dir / f"chrome-controller-{chunk_start}")
+            for offset, (job, capture_id, frame_dir, target) in enumerate(chunk):
+                index = chunk_start + offset + 1
+                print(f"[{index}/{total}] {job.key}", flush=True)
+                scale = job_render_scale(job, args)
+                result = finalize_capture(job, capture_id, frame_dir, target, args, server, scale, chrome)
+                if not result.get("ok") and is_webgl_context_error(result.get("message")):
+                    print("  WebGL context error; restarting Chrome and retrying once...", flush=True)
+                    terminate_process(chrome)
+                    chrome = launch_chrome(args, url, tmp_dir / f"chrome-controller-retry-{index}")
+                    shutil.rmtree(frame_dir, ignore_errors=True)
+                    frame_dir.mkdir(parents=True)
+                    server.jobs.put(job_descriptor(capture_id, job, args, scale))
+                    result = finalize_capture(job, capture_id, frame_dir, target, args, server, scale, chrome)
+                if result.get("ok"):
+                    manifest["jobs"].append(result)
+                else:
+                    manifest["errors"].append(result)
+                # Raw RGBA frames are large; drop each job's frames once encoded so peak
+                # disk stays near one job's worth instead of the whole run's.
+                if not args.keep_temp:
+                    shutil.rmtree(frame_dir, ignore_errors=True)
             # A single long-lived Chrome/WebGL context slowly exhausts GPU resources
             # over a large batch (observed failing with "does not support WebGL"
             # after roughly a dozen large liveevent captures). Recycling the process
-            # periodically keeps each context's lifetime bounded.
-            if restart_interval and jobs_since_restart >= restart_interval:
-                terminate_process(chrome)
-                chrome = launch_chrome(args, url, tmp_dir / f"chrome-controller-{index}")
-                jobs_since_restart = 0
-            scale = job_render_scale(job, args)
-            result = finalize_capture(job, capture_id, frame_dir, target, args, server, scale, chrome)
-            jobs_since_restart += 1
-            if not result.get("ok") and is_webgl_context_error(result.get("message")):
-                print("  WebGL context error; restarting Chrome and retrying once...", flush=True)
-                terminate_process(chrome)
-                chrome = launch_chrome(args, url, tmp_dir / f"chrome-controller-retry-{index}")
-                jobs_since_restart = 0
-                shutil.rmtree(frame_dir, ignore_errors=True)
-                frame_dir.mkdir(parents=True)
-                server.jobs.put(job_descriptor(capture_id, job, args, scale))
-                result = finalize_capture(job, capture_id, frame_dir, target, args, server, scale, chrome)
-                jobs_since_restart += 1
-            if result.get("ok"):
-                manifest["jobs"].append(result)
-            else:
-                manifest["errors"].append(result)
-            # Raw RGBA frames are large; drop each job's frames once encoded so peak
-            # disk stays near one job's worth instead of the whole run's.
-            if not args.keep_temp:
-                shutil.rmtree(frame_dir, ignore_errors=True)
+            # between chunks keeps each context's lifetime bounded.
+            terminate_process(chrome)
+            chrome = None
+            chunk_start = chunk_end
     finally:
-        terminate_process(chrome)
+        if chrome is not None:
+            terminate_process(chrome)
         for _, capture_id, _, _ in plans:
             server.frame_dirs.pop(capture_id, None)
 
@@ -832,7 +986,17 @@ def finalize_capture(
             raise RuntimeError("browser did not report frame dimensions")
 
         if job.group == "liveevent":
-            return finalize_png_capture(job, frame_dir, target, frame_width, frame_height, frame_count, args, scale, alpha)
+            # The browser picks its own render scale per job now (the largest
+            # that avoids GL clamping -- see chooseLiveeventRenderScale in
+            # spine-preview.html), which can differ from the static ceiling
+            # this process requested. The crop-to-final-size division below
+            # must use whatever scale was actually applied, or the math goes
+            # wrong and the output comes out the wrong size.
+            reported_scale = capture_result.get("scale")
+            effective_scale = int(reported_scale) if reported_scale else scale
+            return finalize_png_capture(
+                job, frame_dir, target, frame_width, frame_height, frame_count, args, effective_scale, alpha
+            )
 
         crop = None
         target_width = job.final_width
@@ -1045,6 +1209,9 @@ def job_descriptor(capture_id: str, job: ExportJob, args: argparse.Namespace, sc
             if job.stage_frame
             else None
         ),
+        "output_scale": args.output_scale,
+        "padding": args.padding,
+        "liveevent_max_edge": args.liveevent_max_edge,
     }
 
 

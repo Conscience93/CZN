@@ -583,6 +583,58 @@
       dom.player.style.height = height + "px";
     }
 
+    function evenIntJs(value) {
+      const number = Math.max(2, Math.ceil(value));
+      return number % 2 === 0 ? number : number + 1;
+    }
+
+    // Mirrors compute_dimensions()/even_int() in scripts/export_spine_wiki.py
+    // exactly (pad by 2x, scale, clamp to maxEdge preserving aspect, round up
+    // to even).
+    function computeDimensionsJs(width, height, outputScale, padding, maxEdge) {
+      const paddedWidth = Math.max(1, width + padding * 2);
+      const paddedHeight = Math.max(1, height + padding * 2);
+      let finalWidth = paddedWidth * outputScale;
+      let finalHeight = paddedHeight * outputScale;
+      if (maxEdge && Math.max(finalWidth, finalHeight) > maxEdge) {
+        const scale = maxEdge / Math.max(finalWidth, finalHeight);
+        finalWidth *= scale;
+        finalHeight *= scale;
+      }
+      return { width: evenIntJs(finalWidth), height: evenIntJs(finalHeight) };
+    }
+
+    // Python sizes the capture canvas from a pre-pose guess (the bg_b/bg_f
+    // stage frame's declared size, or the main skeleton's own declared size --
+    // both shown unreliable, e.g. Cassius's main skeleton declares 6224x3515).
+    // Once the browser has actually measured the real framing rect (character
+    // bounds unioned with the stage frame), recompute the canvas's CSS size
+    // from that instead, so the fixed capture-pixel budget matches the real
+    // content instead of being wasted on a wrongly-shaped guess.
+    function correctLiveeventCanvasSize(rawRect, player) {
+      const { width, height } = computeDimensionsJs(
+        rawRect.width,
+        rawRect.height,
+        state.exportSettings.outputScale,
+        state.exportSettings.padding,
+        state.exportSettings.liveeventMaxEdge
+      );
+      state.exportSettings.width = width;
+      state.exportSettings.height = height;
+      applyExportViewportSize();
+      // The patched SceneRenderer.resize() (patchSpineRendererForScale) pins the
+      // canvas's own inline style.width/height to a fixed pixel value on every
+      // call -- once that has run even once with the pre-correction size (it
+      // has, via the autonomous render loop while assets were still loading),
+      // the canvas stops inheriting #player's "100%" CSS rule entirely, so
+      // resizing #player alone no longer has any effect. Reset the canvas's own
+      // inline size directly so the next resize() reads the corrected value.
+      if (player && player.canvas) {
+        player.canvas.style.width = width + "px";
+        player.canvas.style.height = height + "px";
+      }
+    }
+
     // Drive every export job from a single page load. Python enqueues all jobs and
     // serves them one at a time from /__spine_export__/next; we load each asset,
     // capture it, then ask for the next. Reusing this page keeps the Spine runtime
@@ -595,6 +647,15 @@
           job = await fetchNextJob();
         } catch (_error) {
           break;
+        }
+        if (job && job.wait) {
+          // Python dispatches jobs in chunks aligned to --chrome-restart-interval and
+          // only enqueues the next chunk once this Chrome generation is fully retired
+          // (see run_jobs in export_spine_wiki.py). An empty queue between chunks is
+          // reported as "wait" rather than "done" so we don't quit early -- poll again
+          // shortly; Python will likely kill this process before too many retries.
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          continue;
         }
         if (!job || job.done) break;
         applyJobToState(job);
@@ -628,7 +689,10 @@
         layers: Array.isArray(job.layers) ? job.layers : [],
         stageFrame: (job.stage_frame && Number.isFinite(job.stage_frame.width) && Number.isFinite(job.stage_frame.height))
           ? job.stage_frame
-          : null
+          : null,
+        outputScale: Number(job.output_scale || 2),
+        padding: Number(job.padding || 0),
+        liveeventMaxEdge: Number(job.liveevent_max_edge || 0)
       };
       state.transparent = state.exportSettings.transparent;
       if (job.scale && isValidRenderScale(String(job.scale))) {
@@ -1014,8 +1078,6 @@
         disableAnimationMix(entry);
         applyAnimationPose(player, 0);
         applyAnimationPose(player, LIVEEVENT_STABLE_OFFSET_SECONDS);
-        const width = state.exportSettings.width;
-        const height = state.exportSettings.height;
         const offset = new spine.Vector2();
         const size = new spine.Vector2();
         skeleton.getBounds(offset, size);
@@ -1031,6 +1093,22 @@
             // props spread wide), and using the stage rect alone would silently
             // crop the character to fit it.
             rect = unionRect(rect, { x: stageFrame.x, y: stageFrame.y, width: stageFrame.width, height: stageFrame.height });
+          }
+          // Recompute the canvas's own CSS size (and capture pixel budget) from
+          // this measured rect instead of trusting Python's pre-pose guess --
+          // otherwise a fixed canvas sized for the guess forces the camera to
+          // zoom out to cover a bigger/differently-shaped rect than it was
+          // budgeted for, silently losing resolution.
+          correctLiveeventCanvasSize(rect, player);
+          const width = state.exportSettings.width;
+          const height = state.exportSettings.height;
+          // A fixed 4x supersample was tuned for the case where the capture
+          // never got GL-clamped; now that the corrected canvas size routinely
+          // exceeds the GL limit, pick the largest scale that avoids clamping
+          // entirely instead -- see chooseLiveeventRenderScale.
+          if (player.context && player.context.gl) {
+            const chosenScale = chooseLiveeventRenderScale(width, height, player.context.gl);
+            state.renderScale = String(chosenScale);
           }
           return width > 0 && height > 0 ? expandRectToAspect(rect, width / height) : rect;
         }
@@ -1325,7 +1403,7 @@
         const completeResponse = await fetch("/__spine_export__/complete?id=" + encodeURIComponent(settings.id), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ frames: meta.frames, fps, duration, width: meta.width, height: meta.height })
+          body: JSON.stringify({ frames: meta.frames, fps, duration, width: meta.width, height: meta.height, scale: meta.scale })
         });
         if (!completeResponse.ok) throw new Error("Exporter rejected completion: " + completeResponse.status);
         setStatus("Export frames posted.", "ok");
@@ -1372,11 +1450,18 @@
     // still early enough to land before any dialogue-step pose change.
     const LIVEEVENT_STABLE_OFFSET_SECONDS = 0.15;
 
-    // Draws bg_b layers (back to front by index), then the main character, then
-    // bg_f layers, then eff layers, all via the main player's own sceneRenderer so
-    // everything shares one camera/viewport -- mirrors the exact begin()/
-    // drawSkeleton()/end() sequence SpinePlayer.prototype.drawFrame uses
-    // internally for the main skeleton alone.
+    // Draws bg_b layers (back to front), then the main character, then bg_f layers
+    // (back to front), then eff layers, all via the main player's own sceneRenderer
+    // so everything shares one camera/viewport -- mirrors the exact begin()/
+    // drawSkeleton()/end() sequence SpinePlayer.prototype.drawFrame uses internally
+    // for the main skeleton alone.
+    //
+    // Within a role, higher-numbered layers sit farther from the camera and are
+    // drawn first: every liveevent_data/{id}.le sampled lists depth_infos
+    // front-to-back as [fade, bg_f_01, bg_f_02, ..., character, bg_b_01, bg_b_02,
+    // ...] (fade nearest, since it's a screen-covering transition; ascending bg_f/
+    // bg_b index moving away from the character in both directions). Drawing back
+    // to front means descending index order within each role.
     function drawLiveeventComposite(player) {
       // The main skeleton is already posed (postStableFrame poses it once, before
       // reading back the solo frame) -- re-applying the pose here would advance
@@ -1413,7 +1498,7 @@
       for (const layer of state.liveeventLayers) {
         if (byRole[layer.role]) byRole[layer.role].push(layer);
       }
-      for (const role of Object.keys(byRole)) byRole[role].sort((a, b) => a.index - b.index);
+      for (const role of Object.keys(byRole)) byRole[role].sort((a, b) => b.index - a.index);
       renderer.begin();
       for (const layer of byRole.bg_b) renderer.drawSkeleton(layer.skeleton, premultiplied);
       renderer.drawSkeleton(player.skeleton, premultiplied);
@@ -1436,14 +1521,14 @@
       gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, soloPixels);
       await postFrame(exportId, 0, soloPixels);
       if (!state.liveeventLayers.length) {
-        return { frames: 1, width, height };
+        return { frames: 1, width, height, scale: Number(state.renderScale) };
       }
       drawLiveeventComposite(player);
       flushCanvas(canvas);
       const compositePixels = new Uint8Array(width * height * 4);
       gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, compositePixels);
       await postFrame(exportId, 1, compositePixels);
-      return { frames: 2, width, height };
+      return { frames: 2, width, height, scale: Number(state.renderScale) };
     }
 
     function getCanvasGl(canvas) {
@@ -1497,6 +1582,21 @@
         width: Math.max(1, Math.floor(width * factor)),
         height: Math.max(1, Math.floor(height * factor))
       };
+    }
+
+    // Once a capture request exceeds the GL limit, clampToGlLimit scales it back
+    // down to the same ceiling regardless of how large the request was -- so
+    // supersampling beyond that ceiling wastes GPU time/memory on pixels that get
+    // thrown away, and (since the final output is capture/scale) actively lowers
+    // final resolution by dividing the same clamped numerator by a bigger
+    // denominator. Pick the largest scale that doesn't get clamped at all instead.
+    function chooseLiveeventRenderScale(cssWidth, cssHeight, gl) {
+      const maxDim = maxGlDimension(gl);
+      const largest = Math.max(cssWidth, cssHeight);
+      for (const scale of [4, 3, 2, 1]) {
+        if (largest * scale <= maxDim) return scale;
+      }
+      return 1;
     }
 
     async function postFrame(exportId, frame, pixels) {
@@ -1824,6 +1924,7 @@
       return new Promise((resolve, reject) => {
         const tryNext = () => {
           if (window.spine && window.spine.SpinePlayer) {
+            patchScreenBlendMode();
             resolve();
             return;
           }
@@ -1838,6 +1939,7 @@
           index += 1;
           script.onload = () => {
             if (window.spine && window.spine.SpinePlayer) {
+              patchScreenBlendMode();
               resolve();
             } else {
               tryNext();
@@ -1849,6 +1951,26 @@
 
         tryNext();
       });
+    }
+
+    // spine-ts 3.8's WebGLBlendModeConverter maps BlendMode.Screen to the exact
+    // same GL blend func as Normal (src=ONE, dst=ONE_MINUS_SRC_ALPHA), so slots
+    // authored with "screen" blend (e.g. liveevent glow/light overlays like
+    // Haru's "light_1" slot) render as opaque colored smudges instead of
+    // blending away -- the visible red spots on liveevent exports. The game's
+    // own renderer (vendor/Chaos-Zero-Nightmare-ASSet-Ripper/SpineRenderer.cpp)
+    // uses glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_COLOR) for Screen, which is the
+    // textbook GL blend func for the "screen" formula (src + dst*(1-src)).
+    // Patch the dest factor to match so the web preview/export matches the game.
+    function patchScreenBlendMode() {
+      const converter = window.spine && window.spine.webgl && window.spine.webgl.WebGLBlendModeConverter;
+      if (!converter || converter.__screenBlendPatched) return;
+      const originalGetDest = converter.getDestGLBlendMode;
+      converter.getDestGLBlendMode = function (blendMode) {
+        if (blendMode === spine.BlendMode.Screen) return converter.ONE_MINUS_SRC_COLOR;
+        return originalGetDest(blendMode);
+      };
+      converter.__screenBlendPatched = true;
     }
 
     function replayAnimation() {
