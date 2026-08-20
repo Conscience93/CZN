@@ -78,7 +78,8 @@ def episode_to_wikitext(episode: StoryEpisode) -> str:
         wt = scene_to_wikitext(scene)
         if wt:
             parts.append(wt)
-    return "{{StoryTop}}\n{{StoryContainer|\n\n" + "\n{{StoryDialogueSeparator}}\n".join(parts) + "\n\n}}\n{{StoryBottom}}"
+    # return "{{StoryTop}}\n{{StoryContainer|\n\n" + "\n{{StoryDialogueSeparator}}\n".join(parts) + "\n\n}}\n{{StoryBottom}}"
+    return f"{{{{EpisodeDescription|name={episode.name}}}}}\n\n{{{{StoryContainer|\n\n" + "\n{{StoryDialogueSeparator}}\n".join(parts) + "\n\n}}"
 
 
 def chapter_overview_wikitext(
@@ -90,6 +91,8 @@ def chapter_overview_wikitext(
         if lines:
             lines.append("")
         lines.append(f"== Chapter {chapter_num} ==")
+        lines.append(f"=== Description ===")
+        lines.append(f"{{{{ChapterDescription}}}}")
         if main_eps:
             lines.append("=== Main story ===")
             for ep in main_eps:
