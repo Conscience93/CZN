@@ -276,6 +276,44 @@ def build_voice_page_text(lines: list[VoiceLine]) -> str:
     return "\n".join(result)
 
 
+def parse_existing_voice_line_data(text: str) -> dict[str, dict[str, str]]:
+    """Extract {{AudioRow|...}} fields from existing wikitext, keyed by line key."""
+    import wikitextparser as wtp
+
+    result: dict[str, dict[str, str]] = {}
+    for template in wtp.parse(text or "").templates:
+        if template.name.strip().lower() != "audiorow":
+            continue
+        fields = {
+            arg.name.strip(): unescape_template_value(arg.value)
+            for arg in template.arguments
+        }
+        key = fields.get("key", "").strip()
+        if key:
+            result[key] = fields
+    return result
+
+
+def unescape_template_value(value: str) -> str:
+    return value.replace("{{!}}", "|").strip()
+
+
+def fill_missing_voice_line_text(line: VoiceLine, existing: dict[str, str]) -> None:
+    """Fill locally-missing transcripts/translations from existing wiki content.
+
+    Manual corrections on the wiki should not be clobbered by a locally missing
+    (empty) transcript or translation; only gaps are backfilled.
+    """
+    if not existing:
+        return
+    if not line.transcript.get("ja") and existing.get("text_ja"):
+        line.transcript["ja"] = existing["text_ja"]
+    if not line.transcript.get("ko") and existing.get("text_ko"):
+        line.transcript["ko"] = existing["text_ko"]
+    if not line.translation.get("en") and existing.get("text_en"):
+        line.translation["en"] = existing["text_en"]
+
+
 def create_voice_line_audio_pages(
     export: VoiceLineExport,
     combatant_ids: set[int] | None = None,
@@ -298,6 +336,9 @@ def create_voice_line_audio_pages(
         page = page_by_title.get(page_title)
         if page is None:
             continue
+        existing_data = parse_existing_voice_line_data(page.text or "")
+        for line in lines:
+            fill_missing_voice_line_text(line, existing_data.get(line.line_key, {}))
         save_wikitext_page(
             page,
             build_voice_page_text(lines),
@@ -348,6 +389,10 @@ def update_partner_voice_sections(
         if voice_section is None:
             print(f"WARNING: {page.title(with_ns=False)} has no Voice section")
             continue
+
+        existing_data = parse_existing_voice_line_data(voice_section.contents or "")
+        for line in lines:
+            fill_missing_voice_line_text(line, existing_data.get(line.line_key, {}))
 
         section_text = build_partner_voice_section_text(lines)
         voice_section.contents = f"\n{section_text}\n\n" if section_text else "\n"
